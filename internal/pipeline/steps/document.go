@@ -144,7 +144,10 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 	})
 	// Commit whatever the agent edited, regardless of how trustworthy its
 	// structured output turns out to be.
-	commitSummary := extractDocumentSummary(result.Output, "")
+	commitSummary := ""
+	if result != nil {
+		commitSummary = extractDocumentSummary(result.Output, "")
+	}
 	fallbackSummary := "update documentation"
 	if combinedLint {
 		fallbackSummary = "update documentation and fix lint"

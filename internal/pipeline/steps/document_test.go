@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,6 +82,28 @@ func TestDocumentStep_AgentManaged_NormalizesMultilineCommitSummary(t *testing.T
 	}
 	if got := lastCommitMessage(t, dir); got != "no-mistakes(document): update README and references" {
 		t.Fatalf("last commit message = %q", got)
+	}
+}
+
+func TestDocumentStep_AgentFailurePreservesEdits(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{name: "test", runFn: func(_ context.Context, _ agent.RunOpts) (*agent.Result, error) {
+		if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Updated\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return nil, errors.New("agent failed")
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	outcome, err := (&DocumentStep{}).Execute(sctx)
+	if outcome != nil || err == nil || !strings.Contains(err.Error(), "agent document: agent failed") {
+		t.Fatalf("outcome=%+v, err=%v; want agent failure", outcome, err)
+	}
+	if status := gitStatusPorcelain(t, dir); status != "" {
+		t.Fatalf("edits left uncommitted: %q", status)
+	}
+	if got := lastCommitMessage(t, dir); got != "no-mistakes(document): update documentation and fix lint" {
+		t.Fatalf("edits not preserved in Document commit: %q", got)
 	}
 }
 
