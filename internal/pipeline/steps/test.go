@@ -222,12 +222,10 @@ Evidence:
 - The "testing_summary" must account for the complete test step: baseline commands that already ran, scenarios driven, manual or evidence-producing checks, artifacts gathered, and the overall result.
 - Record the exact tests, manual checks, and evidence-producing steps you ran in a "tested" array. Prefer concrete commands or test selectors wrapped in backticks.
 - Always include an "artifacts" array. Leave it empty when you produced no reviewer-visible evidence artifacts. Use artifact path for file artifacts, artifact url for externally visible artifacts, and artifact content for short logs or command output that should be shown directly in the PR.
-- If a scenario fails, determine whether the problem is a real product/code failure, a setup/environment problem you can fix, or a flaky/infrastructure issue.
-- If the issue is setup-related and fixable, fix it and re-drive that scenario.
+- If a scenario fails, determine whether the problem is a real product/code failure, a setup/environment problem, or a flaky/infrastructure issue, and report which it is in the finding.
 
 Rules:
 - Do NOT run linters, formatters, or static analysis tools.
-- Focus on testing and test-related fixes only.
 - A generic driver or user instruction asking for broad or full-suite confirmation does NOT override the targeted-validation product boundary.
 - This evidence turn is read-only in the worktree. Do not edit source, tests, documentation, or configuration. If a change is needed to make validation possible, report an actionable finding for the next fix round instead. Write evidence only to the dedicated evidence directory. Remove transient artifacts your testing created in the worktree before finishing; do not remove dependencies materialized by commands.prepare because later configured commands share them.
 - Keep "testing_summary" high-signal and natural language. Avoid raw logs and noisy counts.
@@ -248,6 +246,10 @@ Rules:
 	if err != nil {
 		return nil, fmt.Errorf("resolve test evidence starting head: %w", err)
 	}
+	preEvidenceStatus, statusErr := git.Run(ctx, sctx.WorkDir, "status", "--porcelain")
+	if statusErr != nil {
+		return nil, fmt.Errorf("check worktree status before test evidence turn: %w", statusErr)
+	}
 	findings, err := runTestAnalyzer(sctx, evidencePrompt)
 	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), "test evidence turn edits", "test evidence turn edits")
 	if commitErr != nil {
@@ -258,6 +260,9 @@ Rules:
 		return nil, fmt.Errorf("resolve test evidence head: %w", headErr)
 	}
 	if committed || evidenceHead != evidenceStartingHead {
+		if strings.TrimSpace(preEvidenceStatus) != "" {
+			return nil, fmt.Errorf("configured test command left uncommitted changes before the evidence turn ran; changes were preserved under Test, but must be reviewed and validated in a new run:\n%s", preEvidenceStatus)
+		}
 		return nil, fmt.Errorf("test evidence turn edited the worktree; changes were preserved under Test, but must be reviewed and validated in a new run")
 	}
 	if err != nil {

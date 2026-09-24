@@ -55,7 +55,7 @@ Combined lint duty (same pass - no separate lint agent will run):
 - Run the relevant checks, preferring only the changed files when possible.
 - Fix documentation issues only. Report source, formatter, linter, and static-analysis changes as findings for a separate fix round.
 - Do not run tests or broader behavioral validation.
-- Report only unresolved lint, format, or static-analysis issues as findings with "category" set to "lint". Do not report lint issues you already fixed.
+- Report every lint, format, or static-analysis issue you find as a finding with "category" set to "lint"; fixing them happens in a later lint fix round, not here.
 
 Set "category" on every finding: "documentation" for documentation findings, "lint" for lint findings.`
 
@@ -243,13 +243,14 @@ Task:
    - Read the diff and changed files to understand what was added, modified, or removed, and the intent of the change.
 
 2. Find what this change made stale
-   - For each fact or contract the change altered, locate its one authoritative owner document (README, docs/, doc comments, config examples, etc.).
+   - For each fact or contract the change altered, locate its one authoritative owner document (README, docs/, etc.).
    - Locate existing duplicates of those facts that are now stale.
 
 3. Fix in the authoritative location
-   - Update each altered fact in its owner document. Changed user-facing behavior must leave its authoritative user documentation accurate.
+   - Update each altered fact in its owner documentation file. Changed user-facing behavior must leave its authoritative user documentation accurate.
    - Remove stale duplicates or reduce them to a short pointer to the owner; do not synchronize full copies.
    - Re-read what you changed to verify it now reflects the code.
+   - When the owner location is not a documentation file (a doc comment, a config example, or other source-adjacent text), report the needed change as a finding instead of editing it.
 
 4. Report only what remains
    - Return a finding only for gaps you could not resolve, judgment calls (e.g. ambiguous intent or conflicting docs), or an out-of-scope consolidation worth a follow-up.

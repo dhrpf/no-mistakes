@@ -40,14 +40,6 @@ var prContentSchema = json.RawMessage(`{
 	"required": ["title", "body"]
 }`)
 
-var prTitleSchema = json.RawMessage(`{
-	"type": "object",
-	"properties": {
-		"title": {"type": "string", "description": "Bare concise pull request title text"}
-	},
-	"required": ["title"]
-}`)
-
 const (
 	githubPullRequestBodyHardLimitChars = 65536
 	// Count bytes, not runes, so multi-byte markdown still stays under
@@ -483,47 +475,6 @@ Final diff paths and statuses:
 	}
 
 	return fallbackPRContent(sctx, finalDiff, riskLine, testingMD, pipelineMD, bodyLimit)
-}
-
-func (s *PRStep) draftConfiguredPRTitle(sctx *pipeline.StepContext, branch, baseBranch, baseSHA string) (string, error) {
-	paths, err := git.Run(sctx.Ctx, sctx.WorkDir, "diff", "--name-status", baseSHA+".."+sctx.Run.HeadSHA)
-	if err != nil {
-		return "", fmt.Errorf("read final branch diff for PR title: %w", err)
-	}
-	prompt := fmt.Sprintf(`Draft only the bare concise pull request title text for the full final branch delta.
-
-Context:
-- branch: %s
-- base commit: %s
-- target commit: %s
-- PR base branch: %s
-
-Rules:
-- Return only the title component in the structured title field.
-- Do not include a branch identifier or any repository formatter prefix or suffix; those are applied deterministically after drafting.
-- Derive the title from the final diff and inspect it directly when the paths below do not provide enough detail.
-- Do not invent behavior.
-
-Final diff paths and statuses:
-%s%s%s`, branch, baseSHA, sctx.Run.HeadSHA, baseBranch, paths, prDraftIntentPromptSection(sctx), executionContextPromptSection(sctx.WorkDir))
-	result, err := sctx.RunAgentContext(sctx.Ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: prTitleSchema,
-		OnChunk:    sctx.LogChunk,
-	})
-	if err != nil {
-		return "", fmt.Errorf("draft configured PR title: %w", err)
-	}
-	var content prContent
-	if result == nil || json.Unmarshal(result.Output, &content) != nil || strings.TrimSpace(content.Title) == "" {
-		return "", fmt.Errorf("agent returned no valid configured PR title")
-	}
-	title, err := renderPRTitle(sctx, strings.TrimSpace(content.Title))
-	if err != nil {
-		return "", err
-	}
-	return title, nil
 }
 
 func prTitlePromptRules(sctx *pipeline.StepContext) string {

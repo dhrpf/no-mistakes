@@ -33,7 +33,7 @@ flowchart TD
 Review has an additional step-specific outstanding condition during carry-forward verification; missing coverage or silence can keep its gate parked even when no blocking-severity finding is reported. A clean review that omits its coverage record parks for approval the same way rather than certifying the head. See the [Review step reference](/no-mistakes/reference/pipeline-steps/#review) for the authoritative carry-forward contract.
 
 The document step applies fixes during its initial pass instead of relying on a follow-up automatic fix loop.
-When `commands.lint` is empty, that same invocation is a combined documentation-and-lint housekeeping pass: it updates documentation, detects relevant linters and formatters, applies safe fixes, verifies both duties, and categorizes any unresolved findings for the document or lint gate.
+When `commands.lint` is empty, that same invocation is a combined documentation-and-lint housekeeping pass: it updates documentation, detects relevant linters and formatters, reports lint and formatting issues as findings without fixing them, and categorizes findings for the document or lint gate.
 The lint step consumes a usable lint result from that pass instead of starting a second cold agent invocation; when the combined pass is skipped, cannot produce trustworthy structured output, or loses its in-memory result across a daemon restart, lint falls back to its own agent pass.
 Unresolved documentation findings and unresolved blocking lint findings pause for approval instead of entering another automatic fix loop.
 
@@ -77,7 +77,7 @@ See [AXI `--yes`](/no-mistakes/reference/cli/#no-mistakes-axi-run) and [TUI yolo
 
 The `review`, `test`, `ci`, and configured-command `lint` steps use this shared model directly; the CI step derives its findings from the pull request's settled checks rather than from an agent, as the [pipeline-step reference](/no-mistakes/reference/pipeline-steps/#ci) describes. The `document` step also uses the same `action` field, but unresolved documentation findings pause for approval because the initial document pass already attempted the documentation updates it could make safely.
 A failed repository gate returns an `ask-user` finding through the same decision model but has no automatic fix budget. The [`gates` reference](/no-mistakes/reference/repo-config/#gates) owns its operator-authorized repair behavior.
-When `commands.lint` is empty, the combined housekeeping pass routes documentation and lint findings to their owning gates. Its unresolved lint findings describe issues left after safe fixes, so blocking findings pause for approval instead of remaining eligible for another automatic fix loop.
+When `commands.lint` is empty, the combined housekeeping pass routes documentation and lint findings to their owning gates. It reports every lint issue it finds rather than fixing them, so the lint step's unresolved findings pause for approval instead of remaining eligible for another automatic fix loop.
 
 Documentation findings use the same approval UI, but the `document` step treats any finding as an unresolved documentation gap or judgment call that should pause for approval.
 
@@ -100,7 +100,7 @@ After a user-triggered fix, the step re-runs. It completes if the check passes a
 When the Review, Test, Document, Lint, CI, or a repository gate repair commits agent changes, its subject comes from `commit.fix_message`.
 The [global config reference](/no-mistakes/reference/global-config/#commitfix_message) owns the template syntax, default, validation rules, size limits, and supported placeholders; the [repo config reference](/no-mistakes/reference/repo-config/#commitfix_message) owns the repository override and trust behavior.
 The pipeline validates the template, agent summary, predicted output size, and final rendered subject before `git add -A`, so a rejected value does not leave changes staged.
-The combined document-and-lint housekeeping pass runs in the Document step, so its documentation and safe lint fixes use the Document value for `{{.Step}}`; configured-command lint fixes use the Lint value.
+The combined document-and-lint housekeeping pass runs in the Document step, so its documentation fixes use the Document value for `{{.Step}}`; configured-command lint fixes use the Lint value.
 
 Before a step-specific fix commit, the pipeline verifies that the live worktree HEAD still descends from the head recorded after its previous commit.
 It allows a legitimate forward commit made by an agent, but aborts the run if an out-of-band backward or divergent reset would drop the reviewed history.
