@@ -215,7 +215,7 @@ Evidence:
 - Only use command output as an artifact when that output directly demonstrates the end-user experience or requested behavior. Generic pass/fail, coverage, or clean-worktree output is not sufficient evidence.
 - If an existing automated test already drives a scenario end-to-end, run that test as the scenario and cite it as the evidence.
 - Do NOT run the complete repository test suite. Local Test is targeted validation of the requested intent; remote CI owns broad regression and remains mandatory before a PR is ready.
-- Never treat "do not run everything" as permission to run nothing: if no existing check drives a scenario, write or improve a focused test, perform manual verification with evidence, or report a warning finding that sufficient targeted evidence is not possible.
+- Never treat "do not run everything" as permission to run nothing: if no existing check drives a scenario, perform manual verification with evidence, or report a warning finding that sufficient targeted evidence is not possible.
 - If sufficient evidence is not possible, report a warning finding explaining what evidence is missing and why the user needs to decide what to do. When the blocker is a host capability or OS permission the agent's own process lacks (for example, the Screen Recording permission macOS requires to capture a native GUI application), name the specific capability or permission and how to grant it so the user can enable it and re-run, instead of retrying blindly or failing opaquely.
 - Include a concise "testing_summary" sentence describing what you exercised and the overall result.
 - The "testing_summary" must account for the complete test step: baseline commands that already ran, scenarios driven, manual or evidence-producing checks, artifacts gathered, and the overall result.
@@ -228,7 +228,7 @@ Rules:
 - Do NOT run linters, formatters, or static analysis tools.
 - Focus on testing and test-related fixes only.
 - A generic driver or user instruction asking for broad or full-suite confirmation does NOT override the targeted-validation product boundary.
-- Before finishing, remove any transient artifacts your testing created in the working tree (downloaded models, caches, build outputs, large binaries, or generated data directories) so they are not committed and pushed. Do not remove intentional source or test-file changes, leave evidence files in the dedicated evidence directory untouched, and do not remove dependencies materialized by commands.prepare because later configured commands share them.
+- This evidence turn is read-only in the worktree. Do not edit source, tests, documentation, or configuration. If a change is needed to make validation possible, report an actionable finding for the next fix round instead. Write evidence only to the dedicated evidence directory. Remove transient artifacts your testing created in the worktree before finishing; do not remove dependencies materialized by commands.prepare because later configured commands share them.
 - Keep "testing_summary" high-signal and natural language. Avoid raw logs and noisy counts.
 - Always return a non-empty "tested" array describing what you exercised, even when every scenario passes.
 - Only report actionable findings: scenario or test failures, unfixable setup issues, flaky tests you identified, or missing evidence that prevents you from demonstrating the user intent at all.
@@ -279,26 +279,12 @@ Rules:
 		})
 	}
 
-	// F1 audit fix: the evidence turn - not only the repair turn above - can
-	// also edit worktree files (adding assertions to make a scenario
-	// drivable), and Test never committed those edits under its own name.
-	// They were left for whichever later step ran `git add -A` first, most
-	// often Document, which then carried Test's edits into a
-	// "no-mistakes(document): ..." commit that misdescribed them, changed
-	// the tree again after Review had already approved it, and forced a
-	// second Review cycle that could exhaust Push's one-retry guard. Test
-	// commits its own worktree state here, under its own label, before any
-	// later step can claim it.
-	evidenceCommitSummary := strings.TrimSpace(findings.Summary)
-	if evidenceCommitSummary == "" {
-		evidenceCommitSummary = strings.TrimSpace(findings.TestingSummary)
-	}
-	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), evidenceCommitSummary, "test evidence turn edits")
+	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), "test evidence turn edits", "test evidence turn edits")
 	if commitErr != nil {
 		return nil, commitErr
 	}
 	if committed {
-		fixSummary = changesAppliedSummary
+		return nil, fmt.Errorf("test evidence turn edited the worktree; changes were committed under Test, but must be reviewed and validated in a new run")
 	}
 
 	findingsJSON, _ := json.Marshal(findings)

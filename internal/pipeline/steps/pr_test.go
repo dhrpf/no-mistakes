@@ -845,11 +845,7 @@ func TestPRStep_ExistingPRWithoutTitleFormatPreservesLiveTitle(t *testing.T) {
 	}
 }
 
-// TestPRStep_ExistingPRWithTitleFormatStillRewritesTitle confirms the F0 fix
-// is scoped correctly: an explicit repository pr.title_format convention
-// still redrafts and sends the title on every managed update, matching
-// documented behavior.
-func TestPRStep_ExistingPRWithTitleFormatStillRewritesTitle(t *testing.T) {
+func TestPRStep_ExistingPRWithTitleFormatPreservesLiveTitle(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 
@@ -875,8 +871,8 @@ func TestPRStep_ExistingPRWithTitleFormatStillRewritesTitle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(logData), "--title PROJ-123: add widget") {
-		t.Fatalf("expected configured PR title format to still apply on update, got:\n%s", logData)
+	if strings.Contains(string(logData), "--title") {
+		t.Fatalf("existing PR title overwritten despite configured format:\n%s", logData)
 	}
 }
 

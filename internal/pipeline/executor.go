@@ -992,6 +992,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	currentRoundID := state.currentRoundID
 	var reviewApprovedHeadSHA string
 	var restartFrom types.StepName
+	reviewInitialHeadSHA := run.HeadSHA
 
 	// Execute with possible fix loop
 rounds:
@@ -1041,12 +1042,7 @@ rounds:
 			// set only on a positive coverage record that also no longer reports
 			// the defect.
 			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, roundFindings, func(file string) bool {
-				// Require this round to have actually deleted the file: present
-				// at the head this round started from, absent from the actual
-				// worktree HEAD now (run.HeadSHA only catches up once the
-				// executor later re-verifies). A file that was simply never
-				// tracked must never read as a deletion remedy.
-				absentBefore, beforeErr := fileAbsentAtHead(ctx, workDir, reviewStartingHeadSHA, file)
+				absentBefore, beforeErr := fileAbsentAtHead(ctx, workDir, reviewInitialHeadSHA, file)
 				absentNow, nowErr := fileAbsentAtHead(ctx, workDir, "HEAD", file)
 				return beforeErr == nil && nowErr == nil && !absentBefore && absentNow
 			})

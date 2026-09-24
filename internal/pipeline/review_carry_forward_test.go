@@ -613,15 +613,15 @@ func TestExecutor_ReviewCarryForward_DeletionRemedyClearsAfterFileIsGone(t *test
 					ReviewablePaths: []string{"CLAUDE.md"},
 				}, nil
 			}
-			// The fixer deletes the file the finding was about.
-			if err := os.Remove(filepath.Join(workDir, "CLAUDE.md")); err != nil {
-				t.Fatal(err)
+			if round == 2 {
+				if err := os.Remove(filepath.Join(workDir, "CLAUDE.md")); err != nil {
+					t.Fatal(err)
+				}
+				execGit(t, workDir, "add", "-A")
+				execGit(t, workDir, "commit", "-m", "remove CLAUDE.md")
+				return &StepOutcome{FixSummary: "removed CLAUDE.md", Findings: `{"findings":[{"id":"review-2","severity":"info","description":"unanchored note","action":"no-op"}],"summary":"note"}`}, nil
 			}
-			execGit(t, workDir, "add", "-A")
-			execGit(t, workDir, "commit", "-m", "remove CLAUDE.md")
-			// The rereview offers no reviewed_paths coverage of CLAUDE.md - a
-			// deleted file is not reviewable - and reports nothing else there.
-			return &StepOutcome{FixSummary: "removed CLAUDE.md"}, nil
+			return &StepOutcome{}, nil
 		},
 	}
 
@@ -629,6 +629,10 @@ func TestExecutor_ReviewCarryForward_DeletionRemedyClearsAfterFileIsGone(t *test
 	done, _ := startExecutor(t, exec, run, repo, workDir)
 
 	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"claude-1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusFixReview)
 	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"claude-1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +645,7 @@ func TestExecutor_ReviewCarryForward_DeletionRemedyClearsAfterFileIsGone(t *test
 	if steps[0].Status != types.StepStatusCompleted {
 		t.Fatalf("step status = %s, want %s (deletion-remedy finding should have cleared)", steps[0].Status, types.StepStatusCompleted)
 	}
-	if steps[0].FindingsJSON != nil {
+	if steps[0].FindingsJSON != nil && strings.Contains(*steps[0].FindingsJSON, "claude-1") {
 		t.Fatalf("deletion-remedy finding still stored as outstanding after its file was deleted: %s", *steps[0].FindingsJSON)
 	}
 }

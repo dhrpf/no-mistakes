@@ -174,7 +174,7 @@ func TestPRTemplateCreateAppliesConfiguredTitleFormat(t *testing.T) {
 	}
 }
 
-func TestPRTemplateUpdateAppliesConfiguredTitleFormat(t *testing.T) {
+func TestPRTemplateUpdatePreservesTitleWithConfiguredFormat(t *testing.T) {
 	t.Parallel()
 	sctx, ag, _ := templateTestContext(t)
 	sctx.Run.Branch = "refs/heads/feature/PROJ-123-add-widget"
@@ -202,8 +202,8 @@ func TestPRTemplateUpdateAppliesConfiguredTitleFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(logs), "--title PROJ-123: add widget") {
-		t.Fatalf("configured title was not published:\n%s", logs)
+	if strings.Contains(string(logs), "--title") {
+		t.Fatalf("existing title was overwritten:\n%s", logs)
 	}
 	body, err := os.ReadFile(bodyFile)
 	if err != nil {
@@ -213,8 +213,8 @@ func TestPRTemplateUpdateAppliesConfiguredTitleFormat(t *testing.T) {
 	if err != nil || strings.TrimSpace(parts.before) != strings.TrimSpace(author) {
 		t.Fatalf("author body changed: %+v, %v", parts, err)
 	}
-	if len(ag.calls) != 1 {
-		t.Fatalf("agent calls = %d, want one title draft", len(ag.calls))
+	if len(ag.calls) != 0 {
+		t.Fatalf("agent calls = %d, want no title draft", len(ag.calls))
 	}
 }
 
