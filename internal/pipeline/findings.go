@@ -532,7 +532,17 @@ func normalizeCoveredPath(value string) string {
 // restated. That is the P1 this closes - the predecessor dropped a selected
 // finding the moment its fix was requested, so a no-op fix could let the run
 // complete with the defect unresolved.
-func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, reviewedPaths, reviewablePaths []string, thisRoundRaw string) string {
+//
+// deletedAndAbsent is the one other way a finding can clear (F2 audit fix): a
+// finding whose remedy is to delete its file can never gain ReviewedPaths
+// coverage, since a deleted file is not reviewable, so without this it stayed
+// outstanding forever even once actually deleted. It reports whether the
+// given file is absent from the current head (the caller wires this to a real
+// git check, never a guess); still gated on the same "nothing else reported in
+// that file" and "no unanchored finding" guards as ordinary coverage, so a
+// reintroduced or reported-elsewhere file cannot silently clear this way. A
+// nil func disables the escape hatch entirely (existing callers unaffected).
+func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, reviewedPaths, reviewablePaths []string, thisRoundRaw string, deletedAndAbsent func(file string) bool) string {
 	if outstandingRaw == "" || len(pendingIDs) == 0 {
 		return outstandingRaw
 	}
@@ -608,6 +618,17 @@ func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, rev
 		}
 		file := normalizeCoveredPath(item.File)
 		if pending[item.ID] && coverageValid && !hasUnanchoredFinding && covered[file] && !hasFindingMatch(item, reported, outstandingCounts, thisRoundCounts) && !reportedFiles[file] {
+			continue
+		}
+		// A finding whose remedy is deleting its file can never gain
+		// reviewedPaths coverage, because a deleted file is not reviewable
+		// (F2 audit fix): it would otherwise stay outstanding forever even
+		// after the file is gone. Accept file absence from the current head as
+		// the positive record instead, but only when this round did not
+		// re-report anything in that file (a reintroduced file would be
+		// caught there) and no unanchored finding makes the round's silence
+		// ambiguous.
+		if pending[item.ID] && file != "" && !hasUnanchoredFinding && !reportedFiles[file] && deletedAndAbsent != nil && deletedAndAbsent(file) {
 			continue
 		}
 		result.Items = append(result.Items, item)

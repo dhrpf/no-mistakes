@@ -191,6 +191,7 @@ Derive the scenarios:
 - Turn that intent into a short list of named scenarios. Each scenario is one concrete thing an end user does and one observable result that proves it, named so a reviewer who never saw this change can tell what was exercised.
 - Where the intent names a failure mode, a guard, or a boundary, add an adversarial scenario that actively tries to break it rather than only confirming the happy path.
 - Keep the list proportionate to the change: cover what this change actually alters, not the whole product.
+- Do not list documentation-only or static-source conditions (a file's presence or content, a comment, a doc section) as scenarios; verifying those by reading is not live and cannot be marked pass. Report them in "tested" instead.
 
 Drive each scenario:
 - Stand the product up the way an end user runs it, in an isolated environment, and drive each scenario end-to-end against that running product.
@@ -276,6 +277,28 @@ Rules:
 			File:        f,
 			Description: fmt.Sprintf("new test file written by agent: %s", f),
 		})
+	}
+
+	// F1 audit fix: the evidence turn - not only the repair turn above - can
+	// also edit worktree files (adding assertions to make a scenario
+	// drivable), and Test never committed those edits under its own name.
+	// They were left for whichever later step ran `git add -A` first, most
+	// often Document, which then carried Test's edits into a
+	// "no-mistakes(document): ..." commit that misdescribed them, changed
+	// the tree again after Review had already approved it, and forced a
+	// second Review cycle that could exhaust Push's one-retry guard. Test
+	// commits its own worktree state here, under its own label, before any
+	// later step can claim it.
+	evidenceCommitSummary := strings.TrimSpace(findings.Summary)
+	if evidenceCommitSummary == "" {
+		evidenceCommitSummary = strings.TrimSpace(findings.TestingSummary)
+	}
+	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), evidenceCommitSummary, "test evidence turn edits")
+	if commitErr != nil {
+		return nil, commitErr
+	}
+	if committed {
+		fixSummary = changesAppliedSummary
 	}
 
 	findingsJSON, _ := json.Marshal(findings)

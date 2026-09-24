@@ -182,6 +182,49 @@ func TestReviewStep_RecordedDecisionsRequirePositiveAssessmentEvenWithoutDiff(t 
 	}
 }
 
+// TestReviewStep_TestDecisionDeferralPromptOwnedByPhaseOwnership pins the F3
+// audit fix: a fix decision recorded at Test - not only Push/PR/CI - that can
+// only be proven by driving the product live is Review's to defer, since
+// Review cannot run the product. Without this, Review had only "unverified"
+// available for such a decision every round, parking the run for a human to
+// re-approve a directive Test itself was about to re-check live.
+func TestReviewStep_TestDecisionDeferralPromptOwnedByPhaseOwnership(t *testing.T) {
+	dir, base, head := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})
+	recordFixDecision(t, sctx, types.StepTest, db.RoundSelectionSourceUser)
+	decisions, err := loadRecordedFixDecisions(sctx)
+	if err != nil || len(decisions) != 1 {
+		t.Fatalf("loadRecordedFixDecisions() = %v, %v, want exactly one decision", decisions, err)
+	}
+	decisionID := decisions[0].ID
+
+	ag := &mockAgent{name: "test", runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		for _, want := range []string{
+			"a requirement solely about this run's later Push/PR/CI is deferred",
+			"A decision recorded at Test whose remaining requirement can only be proven by driving the running product live is deferred the same way, to Test's own next round",
+			"return satisfied with evidence naming the deferred live proof rather than unverified",
+		} {
+			if !strings.Contains(opts.Prompt, want) {
+				t.Errorf("prompt missing %q\nprompt:\n%s", want, opts.Prompt)
+			}
+		}
+		findings := cleanReviewFindings()
+		findings.ReviewedPaths = fullReviewCoverage(t, dir, base)
+		findings.DecisionReviews = []types.DecisionReview{{DecisionID: decisionID, Result: "satisfied", Evidence: "only the deferred live drive remains; Test's next round proves it"}}
+		raw, _ := json.Marshal(findings)
+		return &agent.Result{Output: raw}, nil
+	}}
+	sctx.Agent = ag
+
+	outcome, err := (&ReviewStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.NeedsApproval {
+		t.Fatalf("expected a satisfied Test-phase deferral to clear review, got parked outcome: %+v", outcome)
+	}
+}
+
 func TestRecordedDecisionsNeedReview_OnlyLaterTreesOrHumanDecisions(t *testing.T) {
 	dir, base, head := setupGitRepo(t)
 	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, base, head, config.Commands{})

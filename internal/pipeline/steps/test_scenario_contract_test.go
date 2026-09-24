@@ -44,6 +44,9 @@ func TestTestStep_PromptDerivesScenariosAndMarksLive(t *testing.T) {
 		"Turn that intent into a short list of named scenarios",
 		"one concrete thing an end user does and one observable result that proves it",
 		"add an adversarial scenario that actively tries to break it",
+		// F4 audit fix: static/documentation-only conditions belong in "tested", not as scenarios.
+		`Do not list documentation-only or static-source conditions`,
+		`Report them in "tested" instead`,
 		// Live is a claim about what actually ran.
 		"drive each scenario end-to-end against that running product",
 		"give the pty a non-zero window size (TIOCSWINSZ)",

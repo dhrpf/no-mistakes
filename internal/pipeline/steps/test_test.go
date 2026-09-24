@@ -878,6 +878,57 @@ func testFindingByID(t *testing.T, raw, id string) types.Finding {
 	return types.Finding{}
 }
 
+// TestTestStep_EvidenceTurnCommitsItsOwnWorktreeEdits pins the F1 audit fix:
+// the evidence turn - not only the repair turn - can edit worktree files (for
+// example, adding an assertion to an existing test to make a scenario
+// drivable). Before this fix, the Test step never committed those edits
+// itself, so they were left uncommitted for whichever step ran `git add -A`
+// next (most often Document), which then carried Test's edits into its own
+// commit and forced a superfluous Review restart. Test must commit its own
+// evidence-turn edits under its own label before returning.
+func TestTestStep_EvidenceTurnCommitsItsOwnWorktreeEdits(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			// The evidence turn itself adds an assertion to make a scenario
+			// drivable, without going through fix mode.
+			if err := os.WriteFile(filepath.Join(dir, "evidence_edit.txt"), []byte("added by evidence turn\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"","tested":["go test ./..."],"testing_summary":"drove the scenario after strengthening its assertion","artifacts":[],"scenarios":[{"name":"the change works for a user","result":"pass","live":true,"evidence":"go test ./...","reason":""}],"verdict":"go"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.NeedsApproval {
+		t.Fatalf("outcome = %#v, want no approval needed", outcome)
+	}
+
+	status := gitCmd(t, dir, "status", "--porcelain")
+	if strings.TrimSpace(status) != "" {
+		t.Fatalf("worktree still has uncommitted changes after Test.Execute: %q", status)
+	}
+	log := gitCmd(t, dir, "log", "-1", "--pretty=%s")
+	if !strings.Contains(log, "no-mistakes(test)") {
+		t.Fatalf("latest commit subject = %q, want it labeled under the test step, not left for a later step to claim", log)
+	}
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := gitCmd(t, dir, "rev-parse", "HEAD")
+	if run.HeadSHA != head {
+		t.Fatalf("recorded run head = %s, want it advanced to the test step's own commit %s", run.HeadSHA, head)
+	}
+}
+
 func TestTestStep_FixMode(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

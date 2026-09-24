@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1039,7 +1040,16 @@ rounds:
 			// previous round dispatched: a selected item leaves the outstanding
 			// set only on a positive coverage record that also no longer reports
 			// the defect.
-			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, roundFindings)
+			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, roundFindings, func(file string) bool {
+				// Require this round to have actually deleted the file: present
+				// at the head this round started from, absent from the actual
+				// worktree HEAD now (run.HeadSHA only catches up once the
+				// executor later re-verifies). A file that was simply never
+				// tracked must never read as a deletion remedy.
+				absentBefore, beforeErr := fileAbsentAtHead(ctx, workDir, reviewStartingHeadSHA, file)
+				absentNow, nowErr := fileAbsentAtHead(ctx, workDir, "HEAD", file)
+				return beforeErr == nil && nowErr == nil && !absentBefore && absentNow
+			})
 			pendingVerificationIDs = retainFindingIDs(outstandingFindings, pendingVerificationIDs)
 			selectedOutstandingIDs = retainFindingIDs(outstandingFindings, selectedOutstandingIDs)
 			effectiveFindings = mergeOutstandingFindingsJSON(outstandingFindings, roundFindings, outcome.ReviewedPaths)
@@ -1931,4 +1941,32 @@ func selectedFindingCount(raw string, ids []string) int {
 		return len(ids)
 	}
 	return findingsCount(raw)
+}
+
+// fileAbsentAtHead reports whether file does not exist in the tree at head.
+// It backs resolveVerifiedFindingsJSON's deletion-remedy escape hatch (F2
+// audit fix): a finding whose fix is to delete a file can never gain
+// ReviewedPaths coverage, because a deleted file is not reviewable, so an
+// actual git check of the live tree is the only way to confirm the deletion
+// this way instead. A read failure returns false so the caller stays
+// outstanding, never silently clears.
+func fileAbsentAtHead(ctx context.Context, workDir, head, file string) (bool, error) {
+	if head == "" || file == "" {
+		return false, fmt.Errorf("missing head or file")
+	}
+	// Verify head resolves to a real commit first: a bad head and a real
+	// absence both exit non-zero from `cat-file -e`, and treating that
+	// ambiguity as "absent" would silently clear a finding on a broken read.
+	if _, err := git.Run(ctx, workDir, "cat-file", "-e", head+"^{commit}"); err != nil {
+		return false, err
+	}
+	_, err := git.Run(ctx, workDir, "cat-file", "-e", head+":"+file)
+	if err == nil {
+		return false, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return true, nil
+	}
+	return false, err
 }

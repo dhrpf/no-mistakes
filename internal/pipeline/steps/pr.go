@@ -163,6 +163,16 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			if err != nil {
 				return nil, err
 			}
+			if sctx.Config == nil || sctx.Config.PR.TitleFormat == "" {
+				// An existing PR's title is the author's/reviewer's, not the
+				// pipeline's, to own. Every provider adapter already treats an
+				// empty title as "leave it alone" on update, so clearing the
+				// freshly drafted title here preserves the live one without any
+				// provider-specific change. pr.title_format is the one repo
+				// convention that opts back into rewriting it (see
+				// draftConfiguredPRTitle's parallel owned-body case).
+				content.Title = ""
+			}
 			if err := retargetExistingPRIfNeeded(sctx, host, existing, runPRBaseBranch(sctx)); err != nil {
 				return nil, err
 			}
