@@ -916,6 +916,27 @@ func TestTestStep_EvidenceTurnEditsFailValidationWithoutLeaking(t *testing.T) {
 	}
 }
 
+func TestTestStep_EvidenceAgentCommitStopsValidation(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{name: "test", runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		if err := os.WriteFile(filepath.Join(dir, "agent_edit.txt"), []byte("source edit\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitCmd(t, dir, "add", "-A")
+		gitCmd(t, dir, "commit", "-m", "agent edit")
+		return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"","tested":["manual check"],"testing_summary":"checked","artifacts":[],"scenarios":[{"name":"scenario","result":"pass","live":true,"evidence":"manual check","reason":""}],"verdict":"go"}`)}, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if outcome != nil || err == nil || !strings.Contains(err.Error(), "must be reviewed and validated in a new run") {
+		t.Fatalf("agent commit bypassed evidence guard: outcome=%+v err=%v", outcome, err)
+	}
+	if gitCmd(t, dir, "rev-parse", "HEAD") == headSHA {
+		t.Fatal("agent edit was not preserved")
+	}
+}
+
 func TestTestStep_FixMode(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

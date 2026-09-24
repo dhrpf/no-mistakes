@@ -542,7 +542,7 @@ func normalizeCoveredPath(value string) string {
 // that file" and "no unanchored finding" guards as ordinary coverage, so a
 // reintroduced or reported-elsewhere file cannot silently clear this way. A
 // nil func disables the escape hatch entirely (existing callers unaffected).
-func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, reviewedPaths, reviewablePaths []string, thisRoundRaw string, deletedAndAbsent func(file string) bool) string {
+func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, reviewedPaths, reviewablePaths []string, thisRoundRaw string, deletedAndAbsent func(item types.Finding) bool) string {
 	if outstandingRaw == "" || len(pendingIDs) == 0 {
 		return outstandingRaw
 	}
@@ -628,7 +628,7 @@ func resolveVerifiedFindingsJSON(outstandingRaw string, pendingIDs []string, rev
 		// re-report anything in that file (a reintroduced file would be
 		// caught there) and no unanchored finding makes the round's silence
 		// ambiguous.
-		if pending[item.ID] && file != "" && !hasUnanchoredFinding && !reportedFiles[file] && deletedAndAbsent != nil && deletedAndAbsent(file) {
+		if pending[item.ID] && file != "" && !hasUnanchoredFinding && !reportedFiles[file] && deletedAndAbsent != nil && deletedAndAbsent(item) {
 			continue
 		}
 		result.Items = append(result.Items, item)

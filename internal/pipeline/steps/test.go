@@ -12,6 +12,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -243,7 +244,22 @@ Rules:
 		evidenceGuidance,
 		reassessHistory,
 	)
+	evidenceStartingHead, err := git.HeadSHA(ctx, sctx.WorkDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve test evidence starting head: %w", err)
+	}
 	findings, err := runTestAnalyzer(sctx, evidencePrompt)
+	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), "test evidence turn edits", "test evidence turn edits")
+	if commitErr != nil {
+		return nil, commitErr
+	}
+	evidenceHead, headErr := git.HeadSHA(ctx, sctx.WorkDir)
+	if headErr != nil {
+		return nil, fmt.Errorf("resolve test evidence head: %w", headErr)
+	}
+	if committed || evidenceHead != evidenceStartingHead {
+		return nil, fmt.Errorf("test evidence turn edited the worktree; changes were preserved under Test, but must be reviewed and validated in a new run")
+	}
 	if err != nil {
 		if errors.Is(err, errTestAgentTimeout) {
 			outcome := testAgentTimeoutOutcome(sctx, err, startHead, baselineFindings, baselineSummary, baselineExitCode)
@@ -277,14 +293,6 @@ Rules:
 			File:        f,
 			Description: fmt.Sprintf("new test file written by agent: %s", f),
 		})
-	}
-
-	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), "test evidence turn edits", "test evidence turn edits")
-	if commitErr != nil {
-		return nil, commitErr
-	}
-	if committed {
-		return nil, fmt.Errorf("test evidence turn edited the worktree; changes were committed under Test, but must be reviewed and validated in a new run")
 	}
 
 	findingsJSON, _ := json.Marshal(findings)

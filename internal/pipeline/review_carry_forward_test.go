@@ -650,6 +650,76 @@ func TestExecutor_ReviewCarryForward_DeletionRemedyClearsAfterFileIsGone(t *test
 	}
 }
 
+func TestExecutor_ReviewCarryForward_DeletionRemedySurvivesRecovery(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+	initGitRepo(t, workDir)
+	writeTestFile(t, workDir, "CLAUDE.md", "scaffolding\n")
+	execGit(t, workDir, "add", "CLAUDE.md")
+	execGit(t, workDir, "commit", "-m", "add CLAUDE.md")
+	before := strings.TrimSpace(execGitOutput(t, workDir, "rev-parse", "HEAD"))
+	finding := `{"findings":[{"id":"claude-1","severity":"warning","file":"CLAUDE.md","description":"remove scaffolding","action":"ask-user"}],"summary":"1 finding"}`
+	stepResult, _ := seedRecoveredReviewGate(t, database, run, finding, types.StepStatusFixReview, "")
+	if _, err := database.InsertReviewStepRoundWithProvenance(stepResult.ID, 2, "auto_fix", &finding, nil, before, before, "", nil, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	execGit(t, workDir, "rm", "CLAUDE.md")
+	execGit(t, workDir, "commit", "-m", "remove CLAUDE.md")
+	after := strings.TrimSpace(execGitOutput(t, workDir, "rev-parse", "HEAD"))
+	if err := database.UpdateRunHeadSHA(run.ID, after); err != nil {
+		t.Fatal(err)
+	}
+	parked := `{"findings":[{"id":"claude-1","severity":"warning","file":"CLAUDE.md","description":"remove scaffolding","action":"ask-user"},{"id":"review-2","severity":"info","description":"unanchored note","action":"no-op"}],"summary":"2 findings"}`
+	if err := database.SetStepFindings(stepResult.ID, parked); err != nil {
+		t.Fatal(err)
+	}
+	round, err := database.InsertReviewStepRoundWithProvenance(stepResult.ID, 3, "auto_fix", &parked, nil, after, after, "", nil, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := `["claude-1"]`
+	if err := database.SetStepRoundUserDecision(round.ID, &ids, db.RoundSelectionSourceUser, nil); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := &adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) { return &StepOutcome{}, nil }}
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- exec.Resume(ctx, recovered, repo, workDir) }()
+	deadline := time.Now().Add(5 * time.Second)
+	var respondErr error
+	for time.Now().Before(deadline) {
+		if respondErr = exec.Respond(types.StepReview, types.ActionFix, []string{"claude-1"}); respondErr == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if respondErr != nil {
+		t.Fatalf("respond to recovered review: %v", respondErr)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("recovered deletion remedy did not complete")
+	}
+	got, err := database.GetStepResult(stepResult.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FindingsJSON != nil && strings.Contains(*got.FindingsJSON, "claude-1") {
+		t.Fatalf("deleted finding remained outstanding: %s", *got.FindingsJSON)
+	}
+}
+
 // TestResolveVerifiedFindingsJSON pins the verify-before-clear rule: only a
 // positive coverage record that also stops reporting the defect clears a
 // selected finding. Silence, a round that looked elsewhere, a re-reported
@@ -715,13 +785,13 @@ func TestResolveVerifiedFindingsJSON(t *testing.T) {
 // outstanding set. It still requires the same silence-in-that-file and
 // no-unanchored-finding guards as ordinary coverage.
 func TestResolveVerifiedFindingsJSON_DeletionRemedyClearsWithoutCoverage(t *testing.T) {
-	absent := func(file string) bool { return file == "service.go" }
-	stillPresent := func(file string) bool { return false }
+	absent := func(item types.Finding) bool { return item.File == "service.go" }
+	stillPresent := func(item types.Finding) bool { return false }
 
 	cases := []struct {
 		name             string
 		thisRound        string
-		deletedAndAbsent func(string) bool
+		deletedAndAbsent func(types.Finding) bool
 		wantCleared      bool
 	}{
 		{name: "nil callback never clears", deletedAndAbsent: nil},

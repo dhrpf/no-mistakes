@@ -992,7 +992,13 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	currentRoundID := state.currentRoundID
 	var reviewApprovedHeadSHA string
 	var restartFrom types.StepName
-	reviewInitialHeadSHA := run.HeadSHA
+	var reviewRounds []*db.StepRound
+	if stepName == types.StepReview {
+		reviewRounds, err = e.db.GetRoundsByStep(sr.ID)
+		if err != nil {
+			return false, "", fmt.Errorf("load review deletion provenance: %w", err)
+		}
+	}
 
 	// Execute with possible fix loop
 rounds:
@@ -1041,10 +1047,30 @@ rounds:
 			// previous round dispatched: a selected item leaves the outstanding
 			// set only on a positive coverage record that also no longer reports
 			// the defect.
-			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, roundFindings, func(file string) bool {
-				absentBefore, beforeErr := fileAbsentAtHead(ctx, workDir, reviewInitialHeadSHA, file)
-				absentNow, nowErr := fileAbsentAtHead(ctx, workDir, "HEAD", file)
-				return beforeErr == nil && nowErr == nil && !absentBefore && absentNow
+			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, roundFindings, func(item types.Finding) bool {
+				file := normalizeCoveredPath(item.File)
+				absentNow, err := fileAbsentAtHead(ctx, workDir, "HEAD", file)
+				if err != nil || !absentNow {
+					return false
+				}
+				for _, round := range reviewRounds {
+					if round.StartingHeadSHA == nil || round.FindingsJSON == nil {
+						continue
+					}
+					reported, parseErr := types.ParseFindingsJSON(*round.FindingsJSON)
+					if parseErr != nil {
+						continue
+					}
+					for _, original := range reported.Items {
+						if findingKey(original) == findingKey(item) && normalizeCoveredPath(original.File) == file {
+							absentBefore, beforeErr := fileAbsentAtHead(ctx, workDir, *round.StartingHeadSHA, file)
+							if beforeErr == nil && !absentBefore {
+								return true
+							}
+						}
+					}
+				}
+				return false
 			})
 			pendingVerificationIDs = retainFindingIDs(outstandingFindings, pendingVerificationIDs)
 			selectedOutstandingIDs = retainFindingIDs(outstandingFindings, selectedOutstandingIDs)
@@ -1079,10 +1105,13 @@ rounds:
 			if e.config != nil && e.config.CaptureEvalProvenance {
 				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, e.config.TrustedConfigSHA, e.config.ReplayGlobalYAML, e.config.ReplayRepoYAML, roundDuration)
 			} else {
-				inserted, dbErr = e.db.InsertReviewStepRound(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, roundDuration)
+				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, "", nil, nil, roundDuration)
 			}
 		} else {
 			inserted, dbErr = e.db.InsertStepRoundWithRepair(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, outcome.RepairPublished, roundDuration)
+		}
+		if stepName == types.StepReview && dbErr == nil {
+			reviewRounds = append(reviewRounds, inserted)
 		}
 		if dbErr != nil {
 			currentRoundID = roundInsertID(currentRoundID, inserted, dbErr)

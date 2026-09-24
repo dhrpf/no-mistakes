@@ -184,7 +184,7 @@ Updates matching documentation for code changes and reports only unresolved gaps
 **Behavior:**
 
 - Diffs the base commit against head and skips the step if there are no non-ignored changed files to document
-- Asks the agent to find every documentation gap, update docs or doc comments for all gaps it can resolve, verify its edits, and commit any documentation changes under the placement policy
+- Asks the agent to find documentation gaps, update documentation files, verify its edits, and commit changes under the placement policy. Source or doc-comment edits (including agent-created commits) are preserved but stop the step for review and validation in a new run.
 - The placement policy gives each fact one authoritative owner, prefers removing stale duplicates or replacing them with pointers, avoids new documentation surfaces for perceived gaps, and keeps durable incident lessons near their owner instead of in `AGENTS.md`
 - `document.instructions` can add trusted default-branch ownership rules for the repository
 - When `commands.lint` is empty, performs documentation and agent-driven lint in one combined housekeeping invocation, categorizing findings for the document or lint gate; if that pass is skipped, its structured output is unusable, or a daemon restart loses the in-memory result, lint runs its own agent pass instead

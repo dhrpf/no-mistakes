@@ -84,7 +84,7 @@ func TestDocumentStep_AgentManaged_NormalizesMultilineCommitSummary(t *testing.T
 	}
 }
 
-func TestDocumentStep_AgentManaged_AllowsDocCommentEdits(t *testing.T) {
+func TestDocumentStep_AgentManaged_StopsOnSourceEdit(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "--detach", headSHA)
@@ -100,17 +100,35 @@ func TestDocumentStep_AgentManaged_AllowsDocCommentEdits(t *testing.T) {
 
 	step := &DocumentStep{}
 	outcome, err := step.Execute(sctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if outcome.NeedsApproval {
-		t.Error("expected no approval when agent resolved doc comment gaps")
+	if outcome != nil || err == nil || !strings.Contains(err.Error(), "require review and validation in a new run") {
+		t.Fatalf("source edit accepted: outcome=%+v err=%v", outcome, err)
 	}
 	if status := gitStatusPorcelain(t, dir); status != "" {
-		t.Fatalf("expected clean worktree after doc comment commit, got %q", status)
+		t.Fatalf("source edit left uncommitted: %q", status)
 	}
 	if got := lastCommitMessage(t, dir); got != "no-mistakes(document): update doc comment" {
-		t.Fatalf("last commit message = %q", got)
+		t.Fatalf("source edit lost: %q", got)
+	}
+}
+
+func TestDocumentStep_AgentCommitStopsOnSourceEdit(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{name: "test", runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\nfunc changed() {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitCmd(t, dir, "add", "-A")
+		gitCmd(t, dir, "commit", "-m", "agent source edit")
+		return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"update docs"}`)}, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	outcome, err := (&DocumentStep{}).Execute(sctx)
+	if outcome != nil || err == nil || !strings.Contains(err.Error(), "require review and validation in a new run") {
+		t.Fatalf("agent commit accepted: outcome=%+v err=%v", outcome, err)
+	}
+	if gitCmd(t, dir, "rev-parse", "HEAD") == headSHA {
+		t.Fatal("source edit not preserved")
 	}
 }
 

@@ -53,7 +53,7 @@ const housekeepingLintSection = `
 Combined lint duty (same pass - no separate lint agent will run):
 - Discover the configured linters and formatters for this repository.
 - Run the relevant checks, preferring only the changed files when possible.
-- Apply safe formatter, linter, and static-analysis fixes yourself, then re-run the relevant checks.
+- Fix documentation issues only. Report source, formatter, linter, and static-analysis changes as findings for a separate fix round.
 - Do not run tests or broader behavioral validation.
 - Report only unresolved lint, format, or static-analysis issues as findings with "category" set to "lint". Do not report lint issues you already fixed.
 
@@ -124,6 +124,10 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 	}
 
 	prompt := s.buildPrompt(sctx, baseSHA, ignorePatterns, combinedLint)
+	startingHead, err := git.HeadSHA(ctx, sctx.WorkDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve document starting head: %w", err)
+	}
 	schema := findingsSchema
 	purpose := "document"
 	if combinedLint {
@@ -138,10 +142,6 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 		OnChunk:    sctx.LogChunk,
 		Purpose:    purpose,
 	})
-	if err != nil {
-		return nil, fmt.Errorf("agent document: %w", err)
-	}
-
 	// Commit whatever the agent edited, regardless of how trustworthy its
 	// structured output turns out to be.
 	commitSummary := extractDocumentSummary(result.Output, "")
@@ -149,9 +149,21 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 	if combinedLint {
 		fallbackSummary = "update documentation and fix lint"
 	}
-	committed, err := commitAgentFixesWithResult(sctx, s.Name(), commitSummary, fallbackSummary)
+	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), commitSummary, fallbackSummary)
+	if commitErr != nil {
+		return nil, commitErr
+	}
+	changed, diffErr := git.RunRaw(ctx, sctx.WorkDir, "diff", "--no-renames", "--name-only", "-z", startingHead, "HEAD", "--")
+	if diffErr != nil {
+		return nil, fmt.Errorf("check document source changes: %w", diffErr)
+	}
+	for _, file := range strings.Split(string(changed), "\x00") {
+		if file != "" && !isProsePath(file) {
+			return nil, fmt.Errorf("document turn changed source file %q; edits were preserved but require review and validation in a new run", file)
+		}
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("agent document: %w", err)
 	}
 
 	// Without trustworthy structured output we cannot confirm the agent
@@ -203,9 +215,9 @@ func (s *DocumentStep) buildPrompt(sctx *pipeline.StepContext, baseSHA, ignorePa
 		intro = "Perform the combined documentation and lint housekeeping pass for this change."
 	}
 
-	editRule := "- Only edit documentation files or doc comments. Do not change executable behavior or tests."
+	editRule := "- Only edit documentation files. Report needed source or doc-comment changes as findings; do not edit source or tests."
 	if combinedLint {
-		editRule = "- Documentation edits must only touch documentation files or doc comments. Lint fixes must be safe, mechanical, and behavior-preserving. Never change functional behavior or tests."
+		editRule = "- Only edit documentation files. Report source, doc-comment, lint, and formatter fixes as findings; do not edit source or tests. Never change functional behavior."
 	}
 
 	prompt := fmt.Sprintf(
