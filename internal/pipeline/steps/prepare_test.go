@@ -632,6 +632,9 @@ func TestPushStep_PreparesFormatterWithPendingUntrackedChanges(t *testing.T) {
 func ignoreTestDependencies(t *testing.T, dir string) {
 	t.Helper()
 	exclude := filepath.Join(dir, ".git", "info", "exclude")
+	if err := os.MkdirAll(filepath.Dir(exclude), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(exclude, []byte(".deps/\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

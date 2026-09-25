@@ -193,10 +193,11 @@ func TestDocumentStep_AgentManaged_UnresolvedFindingsNeedApprovalWithoutAutoFixL
 // TestDocumentStep_PromptAppliesPlacementPolicy pins the placement-policy
 // prompt contract from the 121-PR audit: each fact has one authoritative
 // owner, stale duplicates are removed or reduced to pointers (not
-// synchronized), AGENTS.md never receives incident narratives (invariant +
-// regression-test pointer instead), no new surfaces for perceived gaps, and
-// the scope stays on documentation this change made stale. The old
-// exhaustive-corpus-synchronization incentives must be gone.
+// synchronized), AGENTS.md and CLAUDE.md never receive incident narratives
+// (invariant + regression-test pointer instead) and are edited only to
+// correct factually wrong content - never to fill gaps, no new surfaces for
+// perceived gaps, and the scope stays on documentation this change made
+// stale. The old exhaustive-corpus-synchronization incentives must be gone.
 func TestDocumentStep_PromptAppliesPlacementPolicy(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
@@ -219,10 +220,13 @@ func TestDocumentStep_PromptAppliesPlacementPolicy(t *testing.T) {
 		"exactly one authoritative owner document",
 		"remove the duplicate or reduce it to a short pointer to the owner",
 		"never synchronize prose copies",
-		// No new surfaces, no AGENTS.md postmortems; invariants + test pointers.
+		// No new surfaces, no memory-file postmortems; invariants + test
+		// pointers, and memory files are corrected but never added to.
 		"Do not create a new documentation surface merely to close a perceived gap",
 		"Do not add incident narratives or postmortems to AGENTS.md",
 		"point to the regression test or authoritative implementation",
+		"Edit them only to correct or remove information that is factually wrong",
+		"never add content because something is missing",
 		// Ownership map for the standard surfaces.
 		"README.md owns the user-facing product introduction",
 		"CONTRIBUTING.md owns contribution mechanics",
@@ -443,7 +447,7 @@ func TestDocumentStep_HangingAgentFailsRunAfterTimeout(t *testing.T) {
 	}
 }
 
-func TestDocumentStep_SuccessfulReturnAfterTimeoutFailsWithoutCommit(t *testing.T) {
+func TestDocumentStep_SuccessfulReturnAfterTimeoutPreservesEdits(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "--detach", headSHA)
@@ -463,7 +467,7 @@ func TestDocumentStep_SuccessfulReturnAfterTimeoutFailsWithoutCommit(t *testing.
 	if _, err := (&DocumentStep{}).Execute(sctx); err == nil || !strings.Contains(err.Error(), "timed out after 20ms") {
 		t.Fatalf("late successful return error = %v, want timeout", err)
 	}
-	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
-		t.Fatalf("HEAD = %s, want unchanged %s", got, headSHA)
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got == headSHA {
+		t.Fatalf("HEAD = %s, want document edits preserved in a commit", got)
 	}
 }

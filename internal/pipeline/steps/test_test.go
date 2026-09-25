@@ -557,7 +557,7 @@ func TestTestStep_CutAfterAnEarlierStepCommittedStaysApprovable(t *testing.T) {
 	}
 }
 
-func TestTestStep_RepeatedCutKeepsRefusingBeforeAnyEvidenceCompletes(t *testing.T) {
+func TestTestStep_EvidenceCommitFailsBeforeTimeoutPark(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	calls := 0
@@ -576,27 +576,16 @@ func TestTestStep_RepeatedCutKeepsRefusingBeforeAnyEvidenceCompletes(t *testing.
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Config.TestAgentTimeout = 20 * time.Millisecond
 
-	first, err := (&TestStep{}).Execute(sctx)
-	if err != nil {
-		t.Fatalf("first round error = %v", err)
+	_, err := (&TestStep{}).Execute(sctx)
+	if err == nil || !strings.Contains(err.Error(), "test evidence turn edited the worktree") {
+		t.Fatalf("first round error = %v, want preserved edits refused", err)
 	}
-	committed := sctx.Run.HeadSHA
-	if committed == headSHA || !pipeline.HasUnvalidatedWorkRefusal(first.Findings) {
-		t.Fatalf("first round findings = %s, want the agent's commit refused", first.Findings)
-	}
-
-	sctx.Fixing = true
-	sctx.PreviousFindings, sctx.DeferredFindings = answerTestPark(t, first.Findings, types.FindingIDTestAgentTimeout, types.FindingIDTestAgentUnvalidatedWork)
-	second, err := (&TestStep{}).Execute(sctx)
-	if err != nil {
-		t.Fatalf("validation-only round error = %v", err)
-	}
-	if work := testFindingByID(t, second.Findings, types.FindingIDTestAgentUnvalidatedWork).Description; !strings.Contains(work, "log -p "+headSHA+".."+committed) {
-		t.Fatalf("finding = %q, want the earlier cut's unvalidated commit still refused", work)
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got == headSHA {
+		t.Fatal("agent commit was not preserved")
 	}
 }
 
-func TestTestStep_RepeatedCutReMeasuresLeftoversInsteadOfRepeatingThem(t *testing.T) {
+func TestTestStep_EvidenceUncommittedChangesFailBeforeTimeoutPark(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	calls := 0
@@ -612,33 +601,12 @@ func TestTestStep_RepeatedCutReMeasuresLeftoversInsteadOfRepeatingThem(t *testin
 	}}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Config.TestAgentTimeout = 20 * time.Millisecond
-	cutAgain := func(answered string) string {
-		t.Helper()
-		sctx.Fixing = true
-		sctx.PreviousFindings, sctx.DeferredFindings = answerTestPark(t, answered, types.FindingIDTestAgentTimeout, types.FindingIDTestAgentUnvalidatedWork)
-		outcome, err := (&TestStep{}).Execute(sctx)
-		if err != nil {
-			t.Fatalf("validation-only round error = %v", err)
-		}
-		return outcome.Findings
+	_, err := (&TestStep{}).Execute(sctx)
+	if err == nil || !strings.Contains(err.Error(), "test evidence turn edited the worktree") {
+		t.Fatalf("first round error = %v, want preserved edits refused", err)
 	}
-
-	first, err := (&TestStep{}).Execute(sctx)
-	if err != nil {
-		t.Fatalf("first round error = %v", err)
-	}
-	second := cutAgain(first.Findings)
-	work := testFindingByID(t, second, types.FindingIDTestAgentUnvalidatedWork).Description
-	if strings.Count(work, "uncommitted changes to foo_test.go") != 1 || strings.Contains(work, "Since then") {
-		t.Fatalf("finding = %q, want the same leftover named once, not repeated as new work", work)
-	}
-
-	if err := os.Remove(filepath.Join(dir, "foo_test.go")); err != nil {
-		t.Fatal(err)
-	}
-	third := cutAgain(second)
-	if pipeline.HasUnvalidatedWorkRefusal(third) {
-		t.Fatalf("findings = %s, a worktree with the leftover gone and HEAD unmoved must be approvable again", third)
+	if _, err := os.Stat(filepath.Join(dir, "foo_test.go")); err != nil {
+		t.Fatalf("evidence edit not preserved: %v", err)
 	}
 }
 
@@ -1172,8 +1140,7 @@ func TestTestStep_ConfiguredCommandRunsEvidenceWithoutExtractedIntent(t *testing
 func TestTestStep_UserIntentRunsConfiguredCommandThenEvidenceAgent(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	baselineLog := filepath.Join(dir, "baseline.log")
-	testCmd := "go env GOOS > baseline.log"
+	testCmd := "go env GOOS"
 
 	callCount := 0
 	ag := &mockAgent{
@@ -1197,13 +1164,6 @@ func TestTestStep_UserIntentRunsConfiguredCommandThenEvidenceAgent(t *testing.T)
 	if callCount != 1 {
 		t.Fatalf("expected evidence agent to run after configured test command, got %d calls", callCount)
 	}
-	data, err := os.ReadFile(baselineLog)
-	if err != nil {
-		t.Fatalf("expected configured test command to run: %v", err)
-	}
-	if strings.TrimSpace(string(data)) != runtime.GOOS {
-		t.Fatalf("configured test command output = %q, want %s", string(data), runtime.GOOS)
-	}
 	prompt := ag.calls[0].Prompt
 	for _, want := range []string{
 		"Show users a success screen after checkout",
@@ -1222,13 +1182,11 @@ func TestTestStep_UserIntentRunsConfiguredCommandThenEvidenceAgent(t *testing.T)
 		"Write new evidence files into this evidence directory, never into the worktree:",
 		sctx.EvidenceDir,
 		"Do not move, commit, or modify source files only to make evidence linkable",
-		"if no existing check drives a scenario, write or improve a focused test",
 		"perform manual verification with evidence",
 		"Always include an \"artifacts\" array",
 		"If sufficient evidence is not possible, report a warning finding",
 		"When the blocker is a host capability or OS permission the agent's own process lacks",
 		"name the specific capability or permission and how to grant it",
-		"remove any transient artifacts your testing created in the working tree",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("expected prompt to contain %q, got:\n%s", want, prompt)
@@ -1470,7 +1428,6 @@ func TestTestStep_InitialAgent_NoTargetedEvidenceRequiresHonestFinding(t *testin
 	prompt := ag.calls[0].Prompt
 	for _, want := range []string{
 		"Never treat \"do not run everything\" as permission to run nothing",
-		"write or improve a focused test",
 		"perform manual verification with evidence",
 		"report a warning finding that sufficient targeted evidence is not possible",
 		"If sufficient evidence is not possible, report a warning finding",
