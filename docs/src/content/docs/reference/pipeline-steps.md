@@ -213,7 +213,7 @@ Runs linters and static analysis.
 Combined-pass lint findings use the same gate: `error` and `warning` findings pause for a decision, while `info` findings do not.
 
 **Auto-fix:** when `commands.lint` is configured, the lint step follows the same pattern as test - the agent fixes `action: auto-fix` issues using the previous findings plus any per-finding user notes, any selected user-authored findings from the TUI or AXI interface, and the shared [finding decision history](#finding-decision-history), including earlier fix summaries for this step, then lint re-runs.
-When `commands.lint` is empty, unresolved findings from the combined pass pause for approval instead of starting another automatic lint/fix loop, because the agent already attempted safe fixes during housekeeping.
+When `commands.lint` is empty, unresolved findings from the combined pass pause for approval instead of starting another automatic lint/fix loop, because housekeeping reports lint issues rather than fixing them.
 
 **Default auto-fix limit:** `3`.
 
