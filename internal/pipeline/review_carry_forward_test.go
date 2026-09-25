@@ -713,6 +713,24 @@ func TestExecutor_ReviewCarryForward_RenamedFileKeepsFindingOutstanding(t *testi
 	}
 }
 
+func TestFilePurelyDeleted_NonASCIIPath(t *testing.T) {
+	workDir := t.TempDir()
+	initGitRepo(t, workDir)
+	if err := os.MkdirAll(filepath.Join(workDir, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := "docs/café.md"
+	writeTestFile(t, workDir, file, "documentation\n")
+	execGit(t, workDir, "add", file)
+	execGit(t, workDir, "commit", "-m", "add document")
+	startingHead := strings.TrimSpace(execGitOutput(t, workDir, "rev-parse", "HEAD"))
+	execGit(t, workDir, "rm", file)
+	execGit(t, workDir, "commit", "-m", "delete document")
+	if !filePurelyDeleted(context.Background(), workDir, startingHead, file) {
+		t.Fatalf("deletion of %q not recognized", file)
+	}
+}
+
 func TestExecutor_ReviewCarryForward_DeletionRemedySurvivesRecovery(t *testing.T) {
 	database, p, run, repo := setupTest(t)
 	workDir := t.TempDir()

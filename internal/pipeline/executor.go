@@ -2006,12 +2006,12 @@ func fileAbsentAtHead(ctx context.Context, workDir, head, file string) (bool, er
 // recognized by comparing it against its destination, which a single-path
 // pathspec excludes), which would silently misreport a rename as a deletion.
 func filePurelyDeleted(ctx context.Context, workDir, startingHead, file string) bool {
-	out, err := git.Run(ctx, workDir, "diff", "-M", "--diff-filter=D", "--name-only", startingHead, "HEAD")
+	out, err := git.RunRaw(ctx, workDir, "diff", "-M", "--diff-filter=D", "--name-only", "-z", startingHead, "HEAD")
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(out, "\n") {
-		if strings.TrimSpace(line) == file {
+	for _, path := range strings.Split(string(out), "\x00") {
+		if path == file {
 			return true
 		}
 	}
