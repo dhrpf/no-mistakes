@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -991,6 +992,13 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	currentRoundID := state.currentRoundID
 	var reviewApprovedHeadSHA string
 	var restartFrom types.StepName
+	var reviewRounds []*db.StepRound
+	if stepName == types.StepReview {
+		reviewRounds, err = e.db.GetRoundsByStep(sr.ID)
+		if err != nil {
+			return false, "", fmt.Errorf("load review deletion provenance: %w", err)
+		}
+	}
 
 	// Execute with possible fix loop
 rounds:
@@ -1039,7 +1047,31 @@ rounds:
 			// previous round dispatched: a selected item leaves the outstanding
 			// set only on a positive coverage record that also no longer reports
 			// the defect.
-			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, roundFindings)
+			outstandingFindings = resolveVerifiedFindingsJSON(outstandingFindings, pendingVerificationIDs, outcome.ReviewedPaths, outcome.ReviewablePaths, roundFindings, func(item types.Finding) bool {
+				file := normalizeCoveredPath(item.File)
+				absentNow, err := fileAbsentAtHead(ctx, workDir, "HEAD", file)
+				if err != nil || !absentNow {
+					return false
+				}
+				for _, round := range reviewRounds {
+					if round.StartingHeadSHA == nil || round.FindingsJSON == nil {
+						continue
+					}
+					reported, parseErr := types.ParseFindingsJSON(*round.FindingsJSON)
+					if parseErr != nil {
+						continue
+					}
+					for _, original := range reported.Items {
+						if findingKey(original) == findingKey(item) && normalizeCoveredPath(original.File) == file {
+							absentBefore, beforeErr := fileAbsentAtHead(ctx, workDir, *round.StartingHeadSHA, file)
+							if beforeErr == nil && !absentBefore && filePurelyDeleted(ctx, workDir, *round.StartingHeadSHA, file) {
+								return true
+							}
+						}
+					}
+				}
+				return false
+			})
 			pendingVerificationIDs = retainFindingIDs(outstandingFindings, pendingVerificationIDs)
 			selectedOutstandingIDs = retainFindingIDs(outstandingFindings, selectedOutstandingIDs)
 			effectiveFindings = mergeOutstandingFindingsJSON(outstandingFindings, roundFindings, outcome.ReviewedPaths)
@@ -1073,10 +1105,13 @@ rounds:
 			if e.config != nil && e.config.CaptureEvalProvenance {
 				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, e.config.TrustedConfigSHA, e.config.ReplayGlobalYAML, e.config.ReplayRepoYAML, roundDuration)
 			} else {
-				inserted, dbErr = e.db.InsertReviewStepRound(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, roundDuration)
+				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, "", nil, nil, roundDuration)
 			}
 		} else {
 			inserted, dbErr = e.db.InsertStepRoundWithRepair(sr.ID, roundNum, roundTrigger, findingsPtr, fixSummaryPtr, outcome.RepairPublished, roundDuration)
+		}
+		if stepName == types.StepReview && dbErr == nil {
+			reviewRounds = append(reviewRounds, inserted)
 		}
 		if dbErr != nil {
 			currentRoundID = roundInsertID(currentRoundID, inserted, dbErr)
@@ -1931,4 +1966,54 @@ func selectedFindingCount(raw string, ids []string) int {
 		return len(ids)
 	}
 	return findingsCount(raw)
+}
+
+// fileAbsentAtHead reports whether file does not exist in the tree at head.
+// It backs resolveVerifiedFindingsJSON's deletion-remedy escape hatch (F2
+// audit fix): a finding whose fix is to delete a file can never gain
+// ReviewedPaths coverage, because a deleted file is not reviewable, so an
+// actual git check of the live tree is the only way to confirm the deletion
+// this way instead. A read failure returns false so the caller stays
+// outstanding, never silently clears.
+func fileAbsentAtHead(ctx context.Context, workDir, head, file string) (bool, error) {
+	if head == "" || file == "" {
+		return false, fmt.Errorf("missing head or file")
+	}
+	// Verify head resolves to a real commit first: a bad head and a real
+	// absence both exit non-zero from `cat-file -e`, and treating that
+	// ambiguity as "absent" would silently clear a finding on a broken read.
+	if _, err := git.Run(ctx, workDir, "cat-file", "-e", head+"^{commit}"); err != nil {
+		return false, err
+	}
+	_, err := git.Run(ctx, workDir, "cat-file", "-e", head+":"+file)
+	if err == nil {
+		return false, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return true, nil
+	}
+	return false, err
+}
+
+// filePurelyDeleted reports whether file was deleted (not renamed/moved) between
+// startingHead and HEAD. The deletion-remedy exit only proves the file is gone;
+// a fixer that renamed the file to relocate the same code is a different
+// remedy that leaves no rereview coverage of the new location, so this must
+// exclude a rename source before the caller can treat the file as resolved.
+// The diff is run without a pathspec: scoping `git diff` to the file being
+// checked disables rename detection for it (a rename source is only
+// recognized by comparing it against its destination, which a single-path
+// pathspec excludes), which would silently misreport a rename as a deletion.
+func filePurelyDeleted(ctx context.Context, workDir, startingHead, file string) bool {
+	out, err := git.RunRaw(ctx, workDir, "diff", "-M", "--diff-filter=D", "--name-only", "-z", startingHead, "HEAD")
+	if err != nil {
+		return false
+	}
+	for _, path := range strings.Split(string(out), "\x00") {
+		if path == file {
+			return true
+		}
+	}
+	return false
 }

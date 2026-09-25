@@ -878,6 +878,88 @@ func testFindingByID(t *testing.T, raw, id string) types.Finding {
 	return types.Finding{}
 }
 
+func TestTestStep_EvidenceTurnEditsFailValidationWithoutLeaking(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			if err := os.WriteFile(filepath.Join(dir, "evidence_edit.txt"), []byte("added by evidence turn\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"","tested":["go test ./..."],"testing_summary":"drove the scenario after strengthening its assertion","artifacts":[],"scenarios":[{"name":"the change works for a user","result":"pass","live":true,"evidence":"go test ./...","reason":""}],"verdict":"go"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{Test: "printf '\\033[31m'; head -c 6000 /dev/zero | tr '\\000' x; exit 1"})
+
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err == nil || !strings.Contains(err.Error(), "must be reviewed and validated in a new run") || outcome != nil {
+		t.Fatalf("evidence edits must stop validation: outcome=%+v, err=%v", outcome, err)
+	}
+
+	status := gitCmd(t, dir, "status", "--porcelain")
+	if strings.TrimSpace(status) != "" {
+		t.Fatalf("worktree still has uncommitted changes after Test.Execute: %q", status)
+	}
+	log := gitCmd(t, dir, "log", "-1", "--pretty=%s")
+	if !strings.Contains(log, "no-mistakes(test)") || !strings.Contains(log, "test evidence turn edits") || strings.Contains(log, "xxxx") {
+		t.Fatalf("latest commit subject = %q, want a bounded Test edit label", log)
+	}
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := gitCmd(t, dir, "rev-parse", "HEAD")
+	if run.HeadSHA != head {
+		t.Fatalf("recorded run head = %s, want it advanced to the test step's own commit %s", run.HeadSHA, head)
+	}
+}
+
+func TestTestStep_EvidenceAgentCommitStopsValidation(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{name: "test", runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		if err := os.WriteFile(filepath.Join(dir, "agent_edit.txt"), []byte("source edit\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitCmd(t, dir, "add", "-A")
+		gitCmd(t, dir, "commit", "-m", "agent edit")
+		return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"","tested":["manual check"],"testing_summary":"checked","artifacts":[],"scenarios":[{"name":"scenario","result":"pass","live":true,"evidence":"manual check","reason":""}],"verdict":"go"}`)}, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if outcome != nil || err == nil || !strings.Contains(err.Error(), "must be reviewed and validated in a new run") {
+		t.Fatalf("agent commit bypassed evidence guard: outcome=%+v err=%v", outcome, err)
+	}
+	if gitCmd(t, dir, "rev-parse", "HEAD") == headSHA {
+		t.Fatal("agent edit was not preserved")
+	}
+}
+
+func TestTestStep_BaselineArtifactAttributedToConfiguredCommand(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{name: "test", runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+		return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"","tested":["go test ./..."],"testing_summary":"checked","artifacts":[],"scenarios":[{"name":"scenario","result":"pass","live":true,"evidence":"go test ./...","reason":""}],"verdict":"go"}`)}, nil
+	}}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{Test: "echo leftover > baseline.log"})
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if outcome != nil || err == nil || !strings.Contains(err.Error(), "configured prepare/test commands left uncommitted changes") {
+		t.Fatalf("baseline artifact not attributed to configured test command: outcome=%+v err=%v", outcome, err)
+	}
+	if strings.Contains(err.Error(), "test evidence turn edited the worktree") {
+		t.Fatalf("baseline artifact incorrectly blamed on the evidence turn: %v", err)
+	}
+	if len(ag.calls) != 0 {
+		t.Fatalf("evidence agent invoked despite baseline leftovers: %d calls", len(ag.calls))
+	}
+	log := gitCmd(t, dir, "log", "-1", "--pretty=%s")
+	if !strings.Contains(log, "no-mistakes(test)") || !strings.Contains(log, "configured prepare/test command leftovers") {
+		t.Fatalf("latest commit subject = %q, want the baseline leftovers label", log)
+	}
+}
+
 func TestTestStep_FixMode(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

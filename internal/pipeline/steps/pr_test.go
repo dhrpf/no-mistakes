@@ -90,6 +90,12 @@ func TestPRStep_UpdatesExistingPR(t *testing.T) {
 	if !strings.Contains(ghLog, noMistakesPRSignature) {
 		t.Errorf("expected updated PR body to include no-mistakes signature, got:\n%s", ghLog)
 	}
+	// The live title belongs to the author/reviewer; without pr.title_format
+	// the update must never send --title, so gh omits it and the forge title
+	// is untouched (every adapter treats an empty title as "leave it alone").
+	if strings.Contains(ghLog, "--title") {
+		t.Errorf("expected existing PR update to preserve the live title, got:\n%s", ghLog)
+	}
 
 	// Verify PR URL was stored
 	run, err := sctx.DB.GetRun(sctx.Run.ID)
@@ -226,8 +232,13 @@ func TestPRStep_BitbucketUpdatesExistingPR(t *testing.T) {
 	if api.lastAuthHeader == "" {
 		t.Fatal("expected Authorization header for Bitbucket API")
 	}
-	if !strings.Contains(api.lastUpdateBody, "title") || !strings.Contains(api.lastUpdateBody, "description") {
-		t.Fatalf("expected Bitbucket PR update payload to include title and description, got %q", api.lastUpdateBody)
+	// F0 fix: without pr.title_format the live title is preserved, so the
+	// update payload carries only description, never title.
+	if strings.Contains(api.lastUpdateBody, "title") {
+		t.Fatalf("expected Bitbucket PR update payload to omit title and preserve the live one, got %q", api.lastUpdateBody)
+	}
+	if !strings.Contains(api.lastUpdateBody, "description") {
+		t.Fatalf("expected Bitbucket PR update payload to include description, got %q", api.lastUpdateBody)
 	}
 
 	run, err := sctx.DB.GetRun(sctx.Run.ID)
@@ -796,6 +807,72 @@ func TestPRStep_UsesConfiguredTitleFormat(t *testing.T) {
 	}
 	if !strings.Contains(string(logData), "--title PROJ-123: add widget") {
 		t.Fatalf("expected configured PR title, got:\n%s", logData)
+	}
+}
+
+// TestPRStep_ExistingPRWithoutTitleFormatPreservesLiveTitle pins the F0 audit
+// fix: without pr.title_format, updating an existing unowned-body PR must
+// never send --title, so a human-edited live title (e.g. a ticket-prefixed
+// convention the tool does not know about) survives every subsequent run.
+func TestPRStep_ExistingPRWithoutTitleFormatPreservesLiveTitle(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	env, logFile := fakeGH(t, "https://github.com/test/repo/pull/42")
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			payload := json.RawMessage(`{"title":"feat: agent drafted title","body":"## What Changed\n\n- add widget support"}`)
+			return &agent.Result{Output: payload}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+
+	if _, err := (&PRStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghLog := string(logData)
+	if strings.Contains(ghLog, "--title") {
+		t.Fatalf("expected existing PR update to omit --title and preserve the live title, got:\n%s", ghLog)
+	}
+	if !strings.Contains(ghLog, "pr edit") {
+		t.Fatalf("expected gh pr edit to still update the body, got:\n%s", ghLog)
+	}
+}
+
+func TestPRStep_ExistingPRWithTitleFormatPreservesLiveTitle(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	env, logFile := fakeGH(t, "https://github.com/test/repo/pull/42")
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			payload := json.RawMessage(`{"title":"add widget","body":"## What Changed\n\n- add widget support"}`)
+			return &agent.Result{Output: payload}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Run.Branch = "refs/heads/PROJ/123"
+	sctx.Config.Commit.BranchPattern = `^PROJ/([0-9]+)$`
+	sctx.Config.Commit.BranchReplacement = "PROJ-${1}"
+	sctx.Config.PR.TitleFormat = "{{.Branch}}: {{.Title}}"
+
+	if _, err := (&PRStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logData), "--title") {
+		t.Fatalf("existing PR title overwritten despite configured format:\n%s", logData)
 	}
 }
 

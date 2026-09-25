@@ -577,6 +577,230 @@ func TestExecutor_ReviewCarryForward_PositiveCoverageClearsFinding(t *testing.T)
 	}
 }
 
+// TestExecutor_ReviewCarryForward_DeletionRemedyClearsAfterFileIsGone pins
+// the F2 audit fix end to end: a fix round that deletes the finding's file
+// leaves that file unreviewable, so the ordinary ReviewedPaths coverage path
+// alone could never clear it (see F2 audit evidence for real recurrence).
+// The executor's git-backed absence check must clear it instead, once the fix
+// round's own commit shows the file gone and the rereview reports nothing new
+// about it.
+func TestExecutor_ReviewCarryForward_DeletionRemedyClearsAfterFileIsGone(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+	initGitRepo(t, workDir)
+	writeTestFile(t, workDir, "CLAUDE.md", "scaffolding\n")
+	execGit(t, workDir, "add", "CLAUDE.md")
+	execGit(t, workDir, "commit", "-m", "add CLAUDE.md")
+	startHead := strings.TrimSpace(execGitOutput(t, workDir, "rev-parse", "HEAD"))
+	// The deletion-remedy check needs a real head to diff a real deletion
+	// against; setupTest's placeholder "abc123" would fail every git lookup
+	// closed (by design) and never exercise the escape hatch at all.
+	if err := database.UpdateRunHeadSHA(run.ID, startHead); err != nil {
+		t.Fatal(err)
+	}
+	run.HeadSHA = startHead
+
+	round := 0
+	step := &adaptiveCallStep{
+		name: types.StepReview,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			round++
+			if round == 1 {
+				return &StepOutcome{
+					NeedsApproval:   true,
+					Findings:        `{"findings":[{"id":"claude-1","severity":"warning","file":"CLAUDE.md","description":"unrequired scaffolding; remove it","action":"ask-user"}],"summary":"1 finding"}`,
+					ReviewedPaths:   []string{"CLAUDE.md"},
+					ReviewablePaths: []string{"CLAUDE.md"},
+				}, nil
+			}
+			if round == 2 {
+				if err := os.Remove(filepath.Join(workDir, "CLAUDE.md")); err != nil {
+					t.Fatal(err)
+				}
+				execGit(t, workDir, "add", "-A")
+				execGit(t, workDir, "commit", "-m", "remove CLAUDE.md")
+				return &StepOutcome{FixSummary: "removed CLAUDE.md", Findings: `{"findings":[{"id":"review-2","severity":"info","description":"unanchored note","action":"no-op"}],"summary":"note"}`}, nil
+			}
+			return &StepOutcome{}, nil
+		},
+	}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	done, _ := startExecutor(t, exec, run, repo, workDir)
+
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"claude-1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusFixReview)
+	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"claude-1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitExecutorDone(t, done)
+
+	steps, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steps[0].Status != types.StepStatusCompleted {
+		t.Fatalf("step status = %s, want %s (deletion-remedy finding should have cleared)", steps[0].Status, types.StepStatusCompleted)
+	}
+	if steps[0].FindingsJSON != nil && strings.Contains(*steps[0].FindingsJSON, "claude-1") {
+		t.Fatalf("deletion-remedy finding still stored as outstanding after its file was deleted: %s", *steps[0].FindingsJSON)
+	}
+}
+
+func TestExecutor_ReviewCarryForward_RenamedFileKeepsFindingOutstanding(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+	initGitRepo(t, workDir)
+	writeTestFile(t, workDir, "foo.go", "package p\n\nfunc Handler() {}\n")
+	execGit(t, workDir, "add", "foo.go")
+	execGit(t, workDir, "commit", "-m", "add foo.go")
+	startHead := strings.TrimSpace(execGitOutput(t, workDir, "rev-parse", "HEAD"))
+	if err := database.UpdateRunHeadSHA(run.ID, startHead); err != nil {
+		t.Fatal(err)
+	}
+	run.HeadSHA = startHead
+
+	round := 0
+	step := &adaptiveCallStep{
+		name: types.StepReview,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			round++
+			if round == 1 {
+				return &StepOutcome{
+					NeedsApproval:   true,
+					Findings:        `{"findings":[{"id":"foo-1","severity":"warning","file":"foo.go","description":"missing nil check in Handler","action":"ask-user"}],"summary":"1 finding"}`,
+					ReviewedPaths:   []string{"foo.go"},
+					ReviewablePaths: []string{"foo.go"},
+				}, nil
+			}
+			if round == 2 {
+				// The fixer relocates Handler into handler.go instead of deleting
+				// the code; the nil check is still missing at its new location.
+				if err := os.Rename(filepath.Join(workDir, "foo.go"), filepath.Join(workDir, "handler.go")); err != nil {
+					t.Fatal(err)
+				}
+				execGit(t, workDir, "add", "-A")
+				execGit(t, workDir, "commit", "-m", "move Handler to handler.go")
+				// The rereview never covers handler.go, the code's new location.
+				return &StepOutcome{FixSummary: "moved Handler"}, nil
+			}
+			return &StepOutcome{}, nil
+		},
+	}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	done, _ := startExecutor(t, exec, run, repo, workDir)
+
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"foo-1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusFixReview)
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitExecutorDone(t, done)
+
+	steps, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steps[0].FindingsJSON == nil || !strings.Contains(*steps[0].FindingsJSON, "foo-1") {
+		t.Fatalf("renamed-file finding cleared without any rereview of its new location: %v", steps[0].FindingsJSON)
+	}
+}
+
+func TestFilePurelyDeleted_NonASCIIPath(t *testing.T) {
+	workDir := t.TempDir()
+	initGitRepo(t, workDir)
+	if err := os.MkdirAll(filepath.Join(workDir, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := "docs/café.md"
+	writeTestFile(t, workDir, file, "documentation\n")
+	execGit(t, workDir, "add", file)
+	execGit(t, workDir, "commit", "-m", "add document")
+	startingHead := strings.TrimSpace(execGitOutput(t, workDir, "rev-parse", "HEAD"))
+	execGit(t, workDir, "rm", file)
+	execGit(t, workDir, "commit", "-m", "delete document")
+	if !filePurelyDeleted(context.Background(), workDir, startingHead, file) {
+		t.Fatalf("deletion of %q not recognized", file)
+	}
+}
+
+func TestExecutor_ReviewCarryForward_DeletionRemedySurvivesRecovery(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+	initGitRepo(t, workDir)
+	writeTestFile(t, workDir, "CLAUDE.md", "scaffolding\n")
+	execGit(t, workDir, "add", "CLAUDE.md")
+	execGit(t, workDir, "commit", "-m", "add CLAUDE.md")
+	before := strings.TrimSpace(execGitOutput(t, workDir, "rev-parse", "HEAD"))
+	finding := `{"findings":[{"id":"claude-1","severity":"warning","file":"CLAUDE.md","description":"remove scaffolding","action":"ask-user"}],"summary":"1 finding"}`
+	stepResult, _ := seedRecoveredReviewGate(t, database, run, finding, types.StepStatusFixReview, "")
+	if _, err := database.InsertReviewStepRoundWithProvenance(stepResult.ID, 2, "auto_fix", &finding, nil, before, before, "", nil, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	execGit(t, workDir, "rm", "CLAUDE.md")
+	execGit(t, workDir, "commit", "-m", "remove CLAUDE.md")
+	after := strings.TrimSpace(execGitOutput(t, workDir, "rev-parse", "HEAD"))
+	if err := database.UpdateRunHeadSHA(run.ID, after); err != nil {
+		t.Fatal(err)
+	}
+	parked := `{"findings":[{"id":"claude-1","severity":"warning","file":"CLAUDE.md","description":"remove scaffolding","action":"ask-user"},{"id":"review-2","severity":"info","description":"unanchored note","action":"no-op"}],"summary":"2 findings"}`
+	if err := database.SetStepFindings(stepResult.ID, parked); err != nil {
+		t.Fatal(err)
+	}
+	round, err := database.InsertReviewStepRoundWithProvenance(stepResult.ID, 3, "auto_fix", &parked, nil, after, after, "", nil, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := `["claude-1"]`
+	if err := database.SetStepRoundUserDecision(round.ID, &ids, db.RoundSelectionSourceUser, nil); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := &adaptiveCallStep{name: types.StepReview, fn: func(*StepContext) (*StepOutcome, error) { return &StepOutcome{}, nil }}
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- exec.Resume(ctx, recovered, repo, workDir) }()
+	deadline := time.Now().Add(5 * time.Second)
+	var respondErr error
+	for time.Now().Before(deadline) {
+		if respondErr = exec.Respond(types.StepReview, types.ActionFix, []string{"claude-1"}); respondErr == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if respondErr != nil {
+		t.Fatalf("respond to recovered review: %v", respondErr)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("recovered deletion remedy did not complete")
+	}
+	got, err := database.GetStepResult(stepResult.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FindingsJSON != nil && strings.Contains(*got.FindingsJSON, "claude-1") {
+		t.Fatalf("deleted finding remained outstanding: %s", *got.FindingsJSON)
+	}
+}
+
 // TestResolveVerifiedFindingsJSON pins the verify-before-clear rule: only a
 // positive coverage record that also stops reporting the defect clears a
 // selected finding. Silence, a round that looked elsewhere, a re-reported
@@ -617,7 +841,56 @@ func TestResolveVerifiedFindingsJSON(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resolveVerifiedFindingsJSON(reviewCarryTwoFindings, tc.pending, tc.reviewed, []string{"service.go", "cache.go"}, tc.thisRound)
+			got := resolveVerifiedFindingsJSON(reviewCarryTwoFindings, tc.pending, tc.reviewed, []string{"service.go", "cache.go"}, tc.thisRound, nil)
+			parsed, err := types.ParseFindingsJSON(got)
+			if err != nil {
+				t.Fatalf("parse result: %v", err)
+			}
+			cleared := true
+			for _, item := range parsed.Items {
+				if item.ID == "review-1" {
+					cleared = false
+				}
+			}
+			if cleared != tc.wantCleared {
+				t.Fatalf("review-1 cleared = %v, want %v (result: %s)", cleared, tc.wantCleared, got)
+			}
+		})
+	}
+}
+
+// TestResolveVerifiedFindingsJSON_DeletionRemedyClearsWithoutCoverage pins the
+// F2 audit fix: a finding whose remedy is deleting its file can never gain
+// ReviewedPaths coverage, since a deleted file is not reviewable, so the
+// deletedAndAbsent callback is the only way such a finding leaves the
+// outstanding set. It still requires the same silence-in-that-file and
+// no-unanchored-finding guards as ordinary coverage.
+func TestResolveVerifiedFindingsJSON_DeletionRemedyClearsWithoutCoverage(t *testing.T) {
+	absent := func(item types.Finding) bool { return item.File == "service.go" }
+	stillPresent := func(item types.Finding) bool { return false }
+
+	cases := []struct {
+		name             string
+		thisRound        string
+		deletedAndAbsent func(types.Finding) bool
+		wantCleared      bool
+	}{
+		{name: "nil callback never clears", deletedAndAbsent: nil},
+		{name: "file reported still present does not clear", deletedAndAbsent: stillPresent},
+		{name: "file confirmed absent clears without any reviewed_paths coverage", deletedAndAbsent: absent, wantCleared: true},
+		{name: "a round that re-reports the file blocks clearing even when absent",
+			thisRound:        `{"findings":[{"id":"review-9","severity":"info","file":"service.go","line":1,"description":"file was recreated","action":"no-op"}],"summary":"1 finding"}`,
+			deletedAndAbsent: absent,
+		},
+		{name: "an unanchored current finding blocks clearing even when absent",
+			thisRound:        `{"findings":[{"id":"review-9","severity":"info","description":"unanchored observation","action":"no-op"}],"summary":"1 finding"}`,
+			deletedAndAbsent: absent,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveVerifiedFindingsJSON(reviewCarryTwoFindings, []string{"review-1"}, nil, nil, tc.thisRound, tc.deletedAndAbsent)
 			parsed, err := types.ParseFindingsJSON(got)
 			if err != nil {
 				t.Fatalf("parse result: %v", err)
@@ -641,7 +914,7 @@ func TestResolveVerifiedFindingsJSON(t *testing.T) {
 // clears them.
 func TestResolveVerifiedFindingsJSON_FilelessFindingIsNeverVerifiedAway(t *testing.T) {
 	outstanding := `{"findings":[{"id":"review-1","severity":"warning","description":"finding with no file anchor","action":"ask-user"}],"summary":"1 finding"}`
-	got := resolveVerifiedFindingsJSON(outstanding, []string{"review-1"}, []string{"service.go", "cache.go"}, []string{"service.go", "cache.go"}, "")
+	got := resolveVerifiedFindingsJSON(outstanding, []string{"review-1"}, []string{"service.go", "cache.go"}, []string{"service.go", "cache.go"}, "", nil)
 	if !strings.Contains(got, "review-1") {
 		t.Fatalf("file-less finding was verified away by an unrelated coverage record: %s", got)
 	}
@@ -730,7 +1003,7 @@ func TestResolveVerifiedFindingsJSON_DecisionAssessmentsFailClosed(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			got := resolveVerifiedFindingsJSON(outstanding, []string{"review-1"}, nil, nil, string(raw))
+			got := resolveVerifiedFindingsJSON(outstanding, []string{"review-1"}, nil, nil, string(raw), nil)
 			if !strings.Contains(got, "review-1") {
 				t.Fatalf("invalid assessment cleared the decision finding: %s", got)
 			}
@@ -747,7 +1020,7 @@ func TestResolveVerifiedFindingsJSON_DecisionIdentityCollisionFailsClosed(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := resolveVerifiedFindingsJSON(outstanding, []string{"review-1"}, nil, nil, string(raw))
+	got := resolveVerifiedFindingsJSON(outstanding, []string{"review-1"}, nil, nil, string(raw), nil)
 	if !strings.Contains(got, "review-1") {
 		t.Fatalf("colliding decision identity cleared a selected finding: %s", got)
 	}

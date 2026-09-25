@@ -262,11 +262,11 @@ The path is read as a literal Git tree entry, never through the pushed worktree 
 
 #### Author-preserving regeneration
 
-A templated PR contains one delimited, integrity-checked generated appendix. Later runs preserve live author text before and after it, including human checkbox choices and explicit issue-closing lines, and refresh only that appendix. They do not re-fill the narrative. An author's title is also preserved unless `pr.title_format` is configured; that explicit repository convention redrafts the bare title and applies the format on every managed update. Changing or removing `pr.template` does not regenerate an already owned narrative; edit it on the PR when it needs updating. The full intent remains available to reviewers. Removing the generated Intent section is controlled separately below.
+A templated PR contains one delimited, integrity-checked generated appendix. Later runs preserve live author text before and after it, including human checkbox choices and explicit issue-closing lines, and refresh only that appendix. They do not re-fill the narrative. An existing PR's live title is always preserved, even when `pr.title_format` is configured; the format applies only when creating a PR. Changing or removing `pr.template` does not regenerate an already owned narrative; edit it on the PR when it needs updating. The full intent remains available to reviewers. Removing the generated Intent section is controlled separately below.
 
 Ownership is never inferred from a heading's name. An existing author-only body can be adopted without model rewriting. **Legacy descriptions containing an unowned attestation require explicit author reconciliation** before template mode can adopt them: separate/remove their obsolete generated evidence while retaining the desired author text and closing references, then retry. Do not manufacture ownership markers by hand. An edited appendix, missing/duplicate/malformed markers, or a competing attestation fails rather than risking discarded author content. Put author additions outside the generated appendix. The integrity guard detects accidental edits; it is not authentication or a cryptographic signature by no-mistakes.
 
-Updates read the live raw body before deciding which publication path applies. Missing/null/malformed content is not treated as an empty description. Without `pr.title_format`, body-only updates omit title and draft flags rather than reading and resending a possibly stale author title. Template updates re-read immediately before writing and verify the body afterward; observed pre-write edits are retried from the latest body up to three times. Write/readback errors and body divergence fail visibly, without replaying a possibly applied write. This is **not atomic compare-and-swap**: an edit in the provider's final read/write gap can still be lost. New template creations are read back too; a created PR identity may be recorded even if verification then fails, so it remains discoverable for recovery.
+Updates read the live raw body before deciding which publication path applies. Missing/null/malformed content is not treated as an empty description. Body-only updates omit title and draft flags rather than reading and resending a possibly stale author title. Template updates re-read immediately before writing and verify the body afterward; observed pre-write edits are retried from the latest body up to three times. Write/readback errors and body divergence fail visibly, without replaying a possibly applied write. This is **not atomic compare-and-swap**: an edit in the provider's final read/write gap can still be lost. New template creations are read back too; a created PR identity may be recorded even if verification then fails, so it remains discoverable for recovery.
 
 If the complete author text, closing references and rendered evidence cannot fit the publication budget, the step fails instead of truncating them. Evidence rendering retains its existing artifact presentation limits; this adds no body-level eviction to make a template fit. Pre-push and CI-repair restamping update the appendix's integrity guard together with its head-bound attestation, without changing author text.
 
@@ -294,7 +294,7 @@ This is not a privacy filter: generated narrative and other evidence can still c
 
 ### pr.title_format
 
-Configure the title shape no-mistakes applies to newly created and updated pull requests.
+Configure the title shape no-mistakes applies when creating pull requests. Existing PR titles are preserved on every update, even with a configured format.
 
 | | |
 | --- | --- |
@@ -575,7 +575,7 @@ Override auto-fix attempt limits for specific steps. Fields not set here inherit
 
 Set to `0` to disable the follow-up auto-fix loop for a step (findings require manual approval).
 The document step attempts documentation fixes during its initial pass, so unresolved documentation findings pause for approval instead of using an automatic follow-up loop.
-For empty `commands.lint`, the document step's combined housekeeping pass also attempts safe lint fixes, and the lint step consumes its result; unresolved blocking lint findings pause for approval instead of starting another automatic fix loop.
+For empty `commands.lint`, the document step's combined housekeeping pass also detects and reports lint issues without fixing them, and the lint step consumes its result; unresolved blocking lint findings pause for approval instead of starting another automatic fix loop.
 
 `auto_fix.ci` covers the CI step's CI failure and merge-conflict auto-fix attempts.
 The CI step reports each settled failure as an `auto-fix` finding and the shared auto-fix loop drives its fix rounds, exactly as for review; `ask-user` findings (a supported review bot's red check, a provider-attributed check no rerun will replace) never consume an attempt.

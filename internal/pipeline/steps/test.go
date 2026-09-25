@@ -12,6 +12,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -191,6 +192,7 @@ Derive the scenarios:
 - Turn that intent into a short list of named scenarios. Each scenario is one concrete thing an end user does and one observable result that proves it, named so a reviewer who never saw this change can tell what was exercised.
 - Where the intent names a failure mode, a guard, or a boundary, add an adversarial scenario that actively tries to break it rather than only confirming the happy path.
 - Keep the list proportionate to the change: cover what this change actually alters, not the whole product.
+- Do not list documentation-only or static-source conditions (a file's presence or content, a comment, a doc section) as scenarios; verifying those by reading is not live and cannot be marked pass. Report them in "tested" instead.
 
 Drive each scenario:
 - Stand the product up the way an end user runs it, in an isolated environment, and drive each scenario end-to-end against that running product.
@@ -214,23 +216,21 @@ Evidence:
 - Only use command output as an artifact when that output directly demonstrates the end-user experience or requested behavior. Generic pass/fail, coverage, or clean-worktree output is not sufficient evidence.
 - If an existing automated test already drives a scenario end-to-end, run that test as the scenario and cite it as the evidence.
 - Do NOT run the complete repository test suite. Local Test is targeted validation of the requested intent; remote CI owns broad regression and remains mandatory before a PR is ready.
-- Never treat "do not run everything" as permission to run nothing: if no existing check drives a scenario, write or improve a focused test, perform manual verification with evidence, or report a warning finding that sufficient targeted evidence is not possible.
+- Never treat "do not run everything" as permission to run nothing: if no existing check drives a scenario, perform manual verification with evidence, or report a warning finding that sufficient targeted evidence is not possible.
 - If sufficient evidence is not possible, report a warning finding explaining what evidence is missing and why the user needs to decide what to do. When the blocker is a host capability or OS permission the agent's own process lacks (for example, the Screen Recording permission macOS requires to capture a native GUI application), name the specific capability or permission and how to grant it so the user can enable it and re-run, instead of retrying blindly or failing opaquely.
 - Include a concise "testing_summary" sentence describing what you exercised and the overall result.
 - The "testing_summary" must account for the complete test step: baseline commands that already ran, scenarios driven, manual or evidence-producing checks, artifacts gathered, and the overall result.
 - Record the exact tests, manual checks, and evidence-producing steps you ran in a "tested" array. Prefer concrete commands or test selectors wrapped in backticks.
 - Always include an "artifacts" array. Leave it empty when you produced no reviewer-visible evidence artifacts. Use artifact path for file artifacts, artifact url for externally visible artifacts, and artifact content for short logs or command output that should be shown directly in the PR.
-- If a scenario fails, determine whether the problem is a real product/code failure, a setup/environment problem you can fix, or a flaky/infrastructure issue.
-- If the issue is setup-related and fixable, fix it and re-drive that scenario.
+- If a scenario fails, determine whether the problem is a real product/code failure, a setup/environment problem, or a flaky/infrastructure issue, and report which it is in the finding.
 
 Rules:
 - Do NOT run linters, formatters, or static analysis tools.
-- Focus on testing and test-related fixes only.
 - A generic driver or user instruction asking for broad or full-suite confirmation does NOT override the targeted-validation product boundary.
-- Before finishing, remove any transient artifacts your testing created in the working tree (downloaded models, caches, build outputs, large binaries, or generated data directories) so they are not committed and pushed. Do not remove intentional source or test-file changes, leave evidence files in the dedicated evidence directory untouched, and do not remove dependencies materialized by commands.prepare because later configured commands share them.
+- This evidence turn is read-only in the worktree. Do not edit source, tests, documentation, or configuration. If a change is needed to make validation possible, report an actionable finding for the next fix round instead. Write evidence only to the dedicated evidence directory. Remove transient artifacts your testing created in the worktree before finishing; do not remove dependencies materialized by commands.prepare because later configured commands share them.
 - Keep "testing_summary" high-signal and natural language. Avoid raw logs and noisy counts.
 - Always return a non-empty "tested" array describing what you exercised, even when every scenario passes.
-- Only report actionable findings: scenario or test failures, unfixable setup issues, flaky tests you identified, or missing evidence that prevents you from demonstrating the user intent at all.
+- Only report actionable findings: scenario or test failures, setup issues, flaky tests you identified, or missing evidence that prevents you from demonstrating the user intent at all.
 - Do NOT report passing tests (whether existing or new), test counts, coverage summaries, or other non-actionable information.
 - If every scenario passes and there are no issues, return an empty findings array.
 - Set action to "ask-user" when a test failure seems desired and you question the author's intent of having the test in the first place. Set action to "auto-fix" for objective failures that can be safely fixed. Set action to "no-op" for informational notes.%s`,
@@ -242,7 +242,32 @@ Rules:
 		evidenceGuidance,
 		reassessHistory,
 	)
+	evidenceStartingHead, err := git.HeadSHA(ctx, sctx.WorkDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve test evidence starting head: %w", err)
+	}
+	preEvidenceStatus, statusErr := git.Run(ctx, sctx.WorkDir, "status", "--porcelain")
+	if statusErr != nil {
+		return nil, fmt.Errorf("check worktree status before test evidence turn: %w", statusErr)
+	}
+	if strings.TrimSpace(preEvidenceStatus) != "" {
+		if _, commitErr := commitAgentFixesWithResult(sctx, s.Name(), "configured prepare/test command leftovers", "configured prepare/test command leftovers"); commitErr != nil {
+			return nil, commitErr
+		}
+		return nil, fmt.Errorf("configured prepare/test commands left uncommitted changes before the evidence turn ran; changes were preserved under Test, but must be reviewed and validated in a new run:\n%s", preEvidenceStatus)
+	}
 	findings, err := runTestAnalyzer(sctx, evidencePrompt)
+	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), "test evidence turn edits", "test evidence turn edits")
+	if commitErr != nil {
+		return nil, commitErr
+	}
+	evidenceHead, headErr := git.HeadSHA(ctx, sctx.WorkDir)
+	if headErr != nil {
+		return nil, fmt.Errorf("resolve test evidence head: %w", headErr)
+	}
+	if committed || evidenceHead != evidenceStartingHead {
+		return nil, fmt.Errorf("test evidence turn edited the worktree; changes were preserved under Test, but must be reviewed and validated in a new run")
+	}
 	if err != nil {
 		if errors.Is(err, errTestAgentTimeout) {
 			outcome := testAgentTimeoutOutcome(sctx, err, startHead, baselineFindings, baselineSummary, baselineExitCode)

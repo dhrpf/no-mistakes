@@ -297,12 +297,18 @@ func initGitRepo(t *testing.T, dir string) {
 
 func execGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
+	execGitOutput(t, dir, args...)
+}
+
+func execGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
 	}
+	return string(out)
 }
 
 func writeTestFile(t *testing.T, dir, name, content string) {
