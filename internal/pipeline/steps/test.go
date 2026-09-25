@@ -251,10 +251,10 @@ Rules:
 		return nil, fmt.Errorf("check worktree status before test evidence turn: %w", statusErr)
 	}
 	if strings.TrimSpace(preEvidenceStatus) != "" {
-		if _, commitErr := commitAgentFixesWithResult(sctx, s.Name(), "configured test command leftovers", "configured test command leftovers"); commitErr != nil {
+		if _, commitErr := commitAgentFixesWithResult(sctx, s.Name(), "configured prepare/test command leftovers", "configured prepare/test command leftovers"); commitErr != nil {
 			return nil, commitErr
 		}
-		return nil, fmt.Errorf("configured test command left uncommitted changes before the evidence turn ran; changes were preserved under Test, but must be reviewed and validated in a new run:\n%s", preEvidenceStatus)
+		return nil, fmt.Errorf("configured prepare/test commands left uncommitted changes before the evidence turn ran; changes were preserved under Test, but must be reviewed and validated in a new run:\n%s", preEvidenceStatus)
 	}
 	findings, err := runTestAnalyzer(sctx, evidencePrompt)
 	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), "test evidence turn edits", "test evidence turn edits")

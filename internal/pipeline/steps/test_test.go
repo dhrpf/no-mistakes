@@ -945,7 +945,7 @@ func TestTestStep_BaselineArtifactAttributedToConfiguredCommand(t *testing.T) {
 	}}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{Test: "echo leftover > baseline.log"})
 	outcome, err := (&TestStep{}).Execute(sctx)
-	if outcome != nil || err == nil || !strings.Contains(err.Error(), "configured test command left uncommitted changes") {
+	if outcome != nil || err == nil || !strings.Contains(err.Error(), "configured prepare/test commands left uncommitted changes") {
 		t.Fatalf("baseline artifact not attributed to configured test command: outcome=%+v err=%v", outcome, err)
 	}
 	if strings.Contains(err.Error(), "test evidence turn edited the worktree") {
@@ -955,7 +955,7 @@ func TestTestStep_BaselineArtifactAttributedToConfiguredCommand(t *testing.T) {
 		t.Fatalf("evidence agent invoked despite baseline leftovers: %d calls", len(ag.calls))
 	}
 	log := gitCmd(t, dir, "log", "-1", "--pretty=%s")
-	if !strings.Contains(log, "no-mistakes(test)") || !strings.Contains(log, "configured test command leftovers") {
+	if !strings.Contains(log, "no-mistakes(test)") || !strings.Contains(log, "configured prepare/test command leftovers") {
 		t.Fatalf("latest commit subject = %q, want the baseline leftovers label", log)
 	}
 }
