@@ -650,6 +650,69 @@ func TestExecutor_ReviewCarryForward_DeletionRemedyClearsAfterFileIsGone(t *test
 	}
 }
 
+func TestExecutor_ReviewCarryForward_RenamedFileKeepsFindingOutstanding(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+	initGitRepo(t, workDir)
+	writeTestFile(t, workDir, "foo.go", "package p\n\nfunc Handler() {}\n")
+	execGit(t, workDir, "add", "foo.go")
+	execGit(t, workDir, "commit", "-m", "add foo.go")
+	startHead := strings.TrimSpace(execGitOutput(t, workDir, "rev-parse", "HEAD"))
+	if err := database.UpdateRunHeadSHA(run.ID, startHead); err != nil {
+		t.Fatal(err)
+	}
+	run.HeadSHA = startHead
+
+	round := 0
+	step := &adaptiveCallStep{
+		name: types.StepReview,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			round++
+			if round == 1 {
+				return &StepOutcome{
+					NeedsApproval:   true,
+					Findings:        `{"findings":[{"id":"foo-1","severity":"warning","file":"foo.go","description":"missing nil check in Handler","action":"ask-user"}],"summary":"1 finding"}`,
+					ReviewedPaths:   []string{"foo.go"},
+					ReviewablePaths: []string{"foo.go"},
+				}, nil
+			}
+			if round == 2 {
+				// The fixer relocates Handler into handler.go instead of deleting
+				// the code; the nil check is still missing at its new location.
+				if err := os.Rename(filepath.Join(workDir, "foo.go"), filepath.Join(workDir, "handler.go")); err != nil {
+					t.Fatal(err)
+				}
+				execGit(t, workDir, "add", "-A")
+				execGit(t, workDir, "commit", "-m", "move Handler to handler.go")
+				// The rereview never covers handler.go, the code's new location.
+				return &StepOutcome{FixSummary: "moved Handler"}, nil
+			}
+			return &StepOutcome{}, nil
+		},
+	}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	done, _ := startExecutor(t, exec, run, repo, workDir)
+
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"foo-1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusFixReview)
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitExecutorDone(t, done)
+
+	steps, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steps[0].FindingsJSON == nil || !strings.Contains(*steps[0].FindingsJSON, "foo-1") {
+		t.Fatalf("renamed-file finding cleared without any rereview of its new location: %v", steps[0].FindingsJSON)
+	}
+}
+
 func TestExecutor_ReviewCarryForward_DeletionRemedySurvivesRecovery(t *testing.T) {
 	database, p, run, repo := setupTest(t)
 	workDir := t.TempDir()

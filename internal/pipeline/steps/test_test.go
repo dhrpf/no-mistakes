@@ -951,6 +951,13 @@ func TestTestStep_BaselineArtifactAttributedToConfiguredCommand(t *testing.T) {
 	if strings.Contains(err.Error(), "test evidence turn edited the worktree") {
 		t.Fatalf("baseline artifact incorrectly blamed on the evidence turn: %v", err)
 	}
+	if len(ag.calls) != 0 {
+		t.Fatalf("evidence agent invoked despite baseline leftovers: %d calls", len(ag.calls))
+	}
+	log := gitCmd(t, dir, "log", "-1", "--pretty=%s")
+	if !strings.Contains(log, "no-mistakes(test)") || !strings.Contains(log, "configured test command leftovers") {
+		t.Fatalf("latest commit subject = %q, want the baseline leftovers label", log)
+	}
 }
 
 func TestTestStep_FixMode(t *testing.T) {

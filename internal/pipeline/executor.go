@@ -1064,7 +1064,7 @@ rounds:
 					for _, original := range reported.Items {
 						if findingKey(original) == findingKey(item) && normalizeCoveredPath(original.File) == file {
 							absentBefore, beforeErr := fileAbsentAtHead(ctx, workDir, *round.StartingHeadSHA, file)
-							if beforeErr == nil && !absentBefore {
+							if beforeErr == nil && !absentBefore && filePurelyDeleted(ctx, workDir, *round.StartingHeadSHA, file) {
 								return true
 							}
 						}
@@ -1994,4 +1994,26 @@ func fileAbsentAtHead(ctx context.Context, workDir, head, file string) (bool, er
 		return true, nil
 	}
 	return false, err
+}
+
+// filePurelyDeleted reports whether file was deleted (not renamed/moved) between
+// startingHead and HEAD. The deletion-remedy exit only proves the file is gone;
+// a fixer that renamed the file to relocate the same code is a different
+// remedy that leaves no rereview coverage of the new location, so this must
+// exclude a rename source before the caller can treat the file as resolved.
+// The diff is run without a pathspec: scoping `git diff` to the file being
+// checked disables rename detection for it (a rename source is only
+// recognized by comparing it against its destination, which a single-path
+// pathspec excludes), which would silently misreport a rename as a deletion.
+func filePurelyDeleted(ctx context.Context, workDir, startingHead, file string) bool {
+	out, err := git.Run(ctx, workDir, "diff", "-M", "--diff-filter=D", "--name-only", startingHead, "HEAD")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == file {
+			return true
+		}
+	}
+	return false
 }
