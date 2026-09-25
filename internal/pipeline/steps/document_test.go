@@ -102,7 +102,7 @@ func TestDocumentStep_AgentFailurePreservesEdits(t *testing.T) {
 	if status := gitStatusPorcelain(t, dir); status != "" {
 		t.Fatalf("edits left uncommitted: %q", status)
 	}
-	if got := lastCommitMessage(t, dir); got != "no-mistakes(document): update documentation and fix lint" {
+	if got := lastCommitMessage(t, dir); got != "no-mistakes(document): update documentation and report lint issues" {
 		t.Fatalf("edits not preserved in Document commit: %q", got)
 	}
 }

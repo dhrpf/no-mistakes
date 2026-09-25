@@ -230,7 +230,7 @@ Rules:
 - This evidence turn is read-only in the worktree. Do not edit source, tests, documentation, or configuration. If a change is needed to make validation possible, report an actionable finding for the next fix round instead. Write evidence only to the dedicated evidence directory. Remove transient artifacts your testing created in the worktree before finishing; do not remove dependencies materialized by commands.prepare because later configured commands share them.
 - Keep "testing_summary" high-signal and natural language. Avoid raw logs and noisy counts.
 - Always return a non-empty "tested" array describing what you exercised, even when every scenario passes.
-- Only report actionable findings: scenario or test failures, unfixable setup issues, flaky tests you identified, or missing evidence that prevents you from demonstrating the user intent at all.
+- Only report actionable findings: scenario or test failures, setup issues, flaky tests you identified, or missing evidence that prevents you from demonstrating the user intent at all.
 - Do NOT report passing tests (whether existing or new), test counts, coverage summaries, or other non-actionable information.
 - If every scenario passes and there are no issues, return an empty findings array.
 - Set action to "ask-user" when a test failure seems desired and you question the author's intent of having the test in the first place. Set action to "auto-fix" for objective failures that can be safely fixed. Set action to "no-op" for informational notes.%s`,
