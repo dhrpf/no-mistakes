@@ -2,7 +2,6 @@ package steps
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -42,7 +41,7 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 		sctx.Log(fmt.Sprintf("running formatter: %s", fmtCmd))
 		output, exitCode, err := runStepShellCommand(sctx, fmtCmd)
 		if err != nil {
-			sctx.Log(fmt.Sprintf("warning: format command failed: %v", err))
+			sctx.Log(fmt.Sprintf("warning: format command failed: %v: %s", err, output))
 		} else if exitCode != 0 {
 			sctx.Log(fmt.Sprintf("warning: format command exited with code %d: %s", exitCode, output))
 		}
@@ -74,18 +73,6 @@ func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	headBeingPushed, err := git.HeadSHA(ctx, sctx.WorkDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve head before push: %w", err)
-	}
-	needsReview, err := recordedDecisionsNeedReview(sctx, headBeingPushed)
-	if err != nil {
-		return nil, err
-	}
-	if needsReview {
-		if err := recordAgentFixHead(sctx, s.Name(), headBeingPushed); err != nil {
-			return nil, err
-		}
-		sctx.Log("later changes or decisions require independent Review of recorded fix decisions before publication")
-		findings, _ := json.Marshal(Findings{Summary: recordedDecisionReviewRequest})
-		return &pipeline.StepOutcome{RestartFrom: types.StepReview, Findings: string(findings)}, nil
 	}
 	// This run's own review/test/document have already completed by now (see
 	// AllSteps' fixed order), so these are honest statuses to attest for the

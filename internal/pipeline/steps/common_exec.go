@@ -313,19 +313,21 @@ func runShellCommandWithProcessEnv(ctx context.Context, dir string, env []string
 	if runtime.GOOS == "windows" {
 		cmd = exec.CommandContext(ctx, "cmd.exe", "/c", cmdStr)
 	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", cmdStr)
+		cmd = exec.CommandContext(ctx, "sh", "-c", shellenv.OwnOOMScoreScript(cmdStr))
 	}
 	shellenv.ConfigureCooperativeShellCommand(cmd)
 	cmd.Dir = dir
 	if env != nil {
 		cmd.Env = env
 	}
+	oomBefore, haveOOMBaseline := shellenv.OOMKillBaseline()
 	out, err := shellenv.CombinedOutputShellCommand(cmd)
+	err = shellenv.AttributeOOMKill(oomBefore, haveOOMBaseline, err)
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			return string(out), ee.ExitCode(), nil
 		}
-		return "", -1, fmt.Errorf("run command %q: %w", cmdStr, err)
+		return string(out), -1, fmt.Errorf("run command %q: %w", cmdStr, err)
 	}
 	return string(out), 0, nil
 }
