@@ -132,6 +132,20 @@ const (
 	// of age, so a burst of parallel runs that all land inside the retention
 	// window still cannot grow the directory without bound.
 	DefaultEvidenceMaxRuns = 200
+	// DefaultWorktreeRetention bounds how long a terminal run's leftover
+	// worktree directory survives under the default <NM_HOME>/worktrees tree.
+	// A run's worktree is already removed the moment its pipeline finishes
+	// (see daemon.RunManager.removeRunWorktree); this budget only ever governs
+	// the leftover a failed removal - or a protected-path refusal that later
+	// became removable - left behind, so it is deliberately short: these
+	// directories are often full toolchain checkouts (node_modules and the
+	// like), not the small text artifacts test.evidence.retention bounds.
+	DefaultWorktreeRetention = 24 * time.Hour
+	// DefaultWorktreeMaxRuns caps how many leftover worktree directories
+	// survive regardless of age, for the same reason DefaultEvidenceMaxRuns
+	// does: a burst of failures inside the retention window must still not
+	// grow the directory without bound.
+	DefaultWorktreeMaxRuns = 20
 )
 
 // GlobalConfig represents ~/.no-mistakes/config.yaml.
@@ -164,14 +178,19 @@ type GlobalConfig struct {
 	// directory-scoped toolchain configuration (mise, direnv), which resolves
 	// by path ancestry and therefore never reaches a worktree under NM_HOME.
 	// Placement is resolved for every consumer in internal/worktrees.
-	WorktreeRoots           map[string]string `yaml:"worktree_roots"`
-	CITimeout               time.Duration     `yaml:"-"`
-	StepQuietWarning        time.Duration     `yaml:"-"`
-	AgentTimeout            time.Duration     `yaml:"-"`
-	ReviewAgentTimeout      time.Duration     `yaml:"-"`
-	TestAgentTimeout        time.Duration     `yaml:"-"`
-	DaemonConnectTimeout    time.Duration     `yaml:"-"`
-	BranchSyncRemoteTimeout time.Duration     `yaml:"-"`
+	WorktreeRoots map[string]string `yaml:"worktree_roots"`
+	// Worktree bounds how long a terminal run's leftover worktree directory
+	// survives on this machine. Global-only for the same reason as Eval: it
+	// describes local disk retention, never a repository policy, so no
+	// pushed branch may set it.
+	Worktree                Worktree      `yaml:"-"`
+	CITimeout               time.Duration `yaml:"-"`
+	StepQuietWarning        time.Duration `yaml:"-"`
+	AgentTimeout            time.Duration `yaml:"-"`
+	ReviewAgentTimeout      time.Duration `yaml:"-"`
+	TestAgentTimeout        time.Duration `yaml:"-"`
+	DaemonConnectTimeout    time.Duration `yaml:"-"`
+	BranchSyncRemoteTimeout time.Duration `yaml:"-"`
 	// GateReconcileInterval / GateReconcileTimeout bound how often and how
 	// long a parked approval gate is rechecked. They are machine-local
 	// operator knobs (slow hosts, contended gh auth) and global-only so a
@@ -186,8 +205,8 @@ type GlobalConfig struct {
 	// session_reuse: false to force every invocation cold.
 	SessionReuse  bool          `yaml:"-"`
 	ForgeProfiles ForgeProfiles `yaml:"forge_profiles"`
-	// RepositoryOverrides scopes machine-local commit and PR-title formats to
-	// canonicalized remote host/owner/repository identities.
+	// RepositoryOverrides scopes machine-local settings to canonicalized
+	// remote host/owner/repository identities.
 	RepositoryOverrides RepositoryOverrides `yaml:"repository_overrides"`
 	AutoFix             AutoFixRaw
 	// CI is the operator's own CI-step floor. It is the only place the rerun
@@ -220,6 +239,7 @@ type globalConfigRaw struct {
 	AgentConfig             map[string]agentProfileRaw `yaml:"agent_config"`
 	ReviewAgents            map[string]ReviewAgent     `yaml:"review_agents"`
 	WorktreeRoots           map[string]string          `yaml:"worktree_roots"`
+	Worktree                WorktreeRaw                `yaml:"worktree"`
 	CITimeout               string                     `yaml:"ci_timeout"`
 	DaemonConnectTimeout    string                     `yaml:"daemon_connect_timeout"`
 	BranchSyncRemoteTimeout string                     `yaml:"branch_sync_remote_timeout"`
@@ -268,8 +288,9 @@ type ForgeProfiles map[string]ForgeProfile
 
 // RepositoryOverride contains machine-local settings for one normalized remote.
 type RepositoryOverride struct {
-	Commit GlobalCommitRaw `yaml:"commit"`
-	PR     RepositoryPRRaw `yaml:"pr"`
+	Commit   GlobalCommitRaw            `yaml:"commit"`
+	PR       RepositoryPRRaw            `yaml:"pr"`
+	Commands map[string]CommandOverride `yaml:"commands"`
 }
 
 // RepositoryPRRaw contains machine-local per-repository PR title settings.
@@ -707,7 +728,9 @@ type Config struct {
 	LogLevel              string
 	SessionReuse          bool
 	Eval                  Eval
+	Worktree              Worktree
 	Commands              Commands
+	CommandOverrides      map[string]CommandOverride
 	// Gates are the repository's extra checks, already trusted-only by the
 	// time they reach here (EffectiveRepoConfig sourced them from the trusted
 	// default-branch copy).
@@ -845,6 +868,13 @@ type TestRaw struct {
 	// repair turns. Repository-only and trusted-only regardless of
 	// allow_repo_commands; a pushed branch cannot authorize this trigger.
 	Prepare bool `yaml:"prepare"`
+	// BaseAttribution re-runs a failing commands.test on the run's base commit
+	// and reports which failures the change introduced and which already
+	// fail without it. Repository-only and trusted-only regardless of
+	// allow_repo_commands: it spends a second suite run and executes
+	// commands.prepare and commands.test on another checkout, so a pushed
+	// branch cannot authorize it.
+	BaseAttribution bool `yaml:"base_attribution"`
 	// Instructions is the repository's live-validation runbook: how to stand
 	// the product up in an isolated environment so the test step can drive
 	// end-user scenarios against the real thing. It is injected into the test
@@ -897,11 +927,12 @@ type EvidenceRaw struct {
 	MaxRuns   *int    `yaml:"max_runs"`
 }
 
-// Test is the resolved test-step config. Prepare, Instructions and
-// AllowApproveOverFailure come from the trusted default-branch repo config
-// only (see TestRaw).
+// Test is the resolved test-step config. Prepare, BaseAttribution,
+// Instructions and AllowApproveOverFailure come from the trusted
+// default-branch repo config only (see TestRaw).
 type Test struct {
 	Prepare                 bool
+	BaseAttribution         bool
 	Evidence                Evidence
 	Instructions            string
 	AllowApproveOverFailure string
@@ -964,6 +995,27 @@ type Eval struct {
 	// DiversifiedSize caps the official gold-only eval set. 0 means one gold
 	// case per stratum (no Hamilton bound). Unlabeled cases never fill it.
 	DiversifiedSize int
+}
+
+// WorktreeRaw is the YAML representation of local run-worktree retention
+// settings (worktree.retention, worktree.max_runs). Pointer fields distinguish
+// "not set" (nil) from explicit zero values, matching EvidenceRaw.
+type WorktreeRaw struct {
+	Retention *string `yaml:"retention"`
+	MaxRuns   *int    `yaml:"max_runs"`
+}
+
+// Worktree is the resolved local run-worktree retention config. A run's own
+// worktree is already removed the instant its pipeline finishes (see
+// daemon.RunManager.removeRunWorktree); this bounds what a failed removal -
+// or a protected-path refusal that later became removable - leaves behind, on
+// a long-lived daemon that may not restart for weeks (see
+// daemon.cleanupOrphanWorktrees for the crash-recovery counterpart, which
+// runs only at startup). Zero Retention disables age-based reaping and zero
+// MaxRuns disables the count ceiling, matching Evidence.
+type Worktree struct {
+	Retention time.Duration
+	MaxRuns   int
 }
 
 // retiredJev names exactly the two retired jev subkeys so a global config
@@ -1234,6 +1286,17 @@ log_level: info
 # root, and it must be outside NM_HOME and outside every checkout.
 # worktree_roots:
 #   /Users/you/src/my-repo: /Users/you/work/my-repo-runs
+
+# A run's own worktree is already removed the instant its pipeline finishes.
+# This bounds what a rare failed removal - or a protected-path refusal that
+# later became removable - leaves behind, the same way test.evidence.retention
+# bounds evidence: retention ages leftover directories out (default 24 hours)
+# and max_runs caps how many survive regardless of age (default 20). Set
+# retention to "unlimited", or either to 0, to disable that bound. Global-only,
+# like test.evidence's retention settings.
+# worktree:
+#   retention: 24h
+#   max_runs: 20
 
 # Maximum follow-up auto-fix attempts per step (0 = disabled after the initial pass)
 # Document fixes are attempted during the initial document pass.
@@ -2008,6 +2071,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 		LogLevel:                "info",
 		SessionReuse:            true,
 		Eval:                    evalDefaults(),
+		Worktree:                worktreeDefaults(),
 	}
 }
 
@@ -2177,6 +2241,9 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if err := validateEvalRaw(raw.Eval); err != nil {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
+	if err := validateWorktreeRaw(raw.Worktree); err != nil {
+		return nil, fmt.Errorf("parse global config: %w", err)
+	}
 	if err := validateRebaseRaw(raw.Rebase); err != nil {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
@@ -2321,6 +2388,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg.Test = raw.Test
 	cfg.Providers = raw.Providers
 	applyEvalOverrides(&cfg.Eval, &raw.Eval)
+	applyWorktreeOverrides(&cfg.Worktree, &raw.Worktree)
 
 	return cfg, nil
 }
@@ -2597,10 +2665,11 @@ func validatePathInstructionGlob(pattern string) error {
 // since they cannot run arbitrary shell, select a process, or spend the
 // maintainer's CI minutes.
 // The exceptions inside test are prepare, which eagerly runs setup before an
-// agent-only Test, evidence.branch, which names a git ref the daemon pushes to,
-// instructions, which steers the gate that validates the pushed branch, and
-// allow_approve_over_failure, which waives the required check for an
-// approved-over-failure commands.test. All four are trusted-only.
+// agent-only Test, base_attribution, which re-runs a failing commands.test on
+// the base commit, evidence.branch, which names a git ref the daemon pushes
+// to, instructions, which steers the gate that validates the pushed branch,
+// and allow_approve_over_failure, which waives the required check for an
+// approved-over-failure commands.test. All five are trusted-only.
 func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *RepoConfig {
 	if pushed == nil {
 		pushed = &RepoConfig{}
@@ -2672,6 +2741,9 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// The eager setup trigger is trusted-only even when executable command
 		// values may come from the pushed branch.
 		effective.Test.Prepare = trusted.Test.Prepare
+		// Base attribution spends a second suite run and executes commands on
+		// another checkout, so it is trusted-only like the prepare trigger.
+		effective.Test.BaseAttribution = trusted.Test.BaseAttribution
 		// test.allow_approve_over_failure opts the required check into
 		// accepting a Test step approved over a failing commands.test. It is
 		// trusted-only for the same reason no_ci is: a pushed branch must not
@@ -2702,6 +2774,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		effective.Test.Evidence.Branch = nil
 		effective.Test.Instructions = ""
 		effective.Test.Prepare = false
+		effective.Test.BaseAttribution = false
 		effective.Test.AllowApproveOverFailure = ""
 		if !allowRepoCommands {
 			effective.PR.BaseBranch = ""
@@ -2856,6 +2929,63 @@ func parseEvidenceRetention(value string) (time.Duration, error) {
 		return 0, nil
 	}
 	return d, nil
+}
+
+// worktreeDefaults returns the default run-worktree retention settings.
+func worktreeDefaults() Worktree {
+	return Worktree{Retention: DefaultWorktreeRetention, MaxRuns: DefaultWorktreeMaxRuns}
+}
+
+// applyWorktreeOverrides applies non-nil raw values onto resolved defaults.
+// The retention value is validated at config parse time (validateWorktreeRaw).
+func applyWorktreeOverrides(dst *Worktree, src *WorktreeRaw) {
+	if src.Retention != nil {
+		if d, err := parseWorktreeRetention(*src.Retention); err == nil {
+			dst.Retention = d
+		}
+	}
+	if src.MaxRuns != nil && *src.MaxRuns >= 0 {
+		dst.MaxRuns = *src.MaxRuns
+	}
+}
+
+// parseWorktreeRetention interprets worktree.retention with the same keyword
+// set as test.evidence.retention (see parseEvidenceRetention): "unlimited"
+// (also "none"/"off"/"never"), or any non-positive duration, disables
+// age-based reaping and resolves to 0, which keeps every leftover worktree
+// until the max_runs ceiling removes it.
+func parseWorktreeRetention(value string) (time.Duration, error) {
+	trimmed := strings.ToLower(strings.TrimSpace(value))
+	switch trimmed {
+	case "":
+		return DefaultWorktreeRetention, nil
+	case "unlimited", "none", "off", "never":
+		return 0, nil
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("worktree.retention: parse %q: %w", value, err)
+	}
+	if d <= 0 {
+		return 0, nil
+	}
+	return d, nil
+}
+
+// validateWorktreeRaw fails the config closed on an unparseable
+// worktree.retention or a negative worktree.max_runs, matching
+// validateTestRaw/validateEvalRaw: surfacing the typo here beats a daemon
+// that silently falls back to the default budget.
+func validateWorktreeRaw(raw WorktreeRaw) error {
+	if raw.Retention != nil {
+		if _, err := parseWorktreeRetention(*raw.Retention); err != nil {
+			return err
+		}
+	}
+	if raw.MaxRuns != nil && *raw.MaxRuns < 0 {
+		return fmt.Errorf("worktree.max_runs must be 0 (keep every leftover) or greater, got %d", *raw.MaxRuns)
+	}
+	return nil
 }
 
 // evalDefaults returns the default local evaluation-corpus settings. Both
@@ -3070,8 +3200,9 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	return merge(global, repo, nil)
 }
 
-// MergeForRemote combines global and per-repo config, applying a matching
-// machine-local repository override between the global defaults and repo config.
+// MergeForRemote combines global and per-repo config. Matching machine-local
+// formats sit between global defaults and repo formats; command execution
+// settings supplement the repository commands without replacing them.
 func MergeForRemote(global *GlobalConfig, repo *RepoConfig, remote string) *Config {
 	var override *RepositoryOverride
 	if global != nil {
@@ -3120,6 +3251,7 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 	// to describe. repo here is the EffectiveRepoConfig result, so this value
 	// is already trusted-only.
 	test.Prepare = repo.Test.Prepare
+	test.BaseAttribution = repo.Test.BaseAttribution
 	test.Instructions = strings.TrimSpace(repo.Test.Instructions)
 	test.AllowApproveOverFailure = strings.TrimSpace(repo.Test.AllowApproveOverFailure)
 
@@ -3190,8 +3322,10 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		LogLevel:              global.LogLevel,
 		SessionReuse:          global.SessionReuse,
 		// Eval is global-only by design (see GlobalConfig.Eval), so it is
-		// copied straight through with no repository override step.
+		// copied straight through with no repository override step. Worktree
+		// is global-only for the same reason (see GlobalConfig.Worktree).
 		Eval:           global.Eval,
+		Worktree:       global.Worktree,
 		Commands:       repo.Commands,
 		Gates:          copyGates(repo.Gates),
 		IgnorePatterns: repo.IgnorePatterns,
@@ -3218,6 +3352,10 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		// trusted-only (EffectiveRepoConfig sourced it from the trusted copy).
 		DisableProjectSettings: repo.DisableProjectSettings,
 		NoCI:                   repo.NoCI,
+	}
+
+	if override != nil {
+		cfg.CommandOverrides = copyCommandOverrides(override.Commands)
 	}
 
 	if repo.Agent != "" {
