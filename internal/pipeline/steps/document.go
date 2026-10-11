@@ -163,7 +163,7 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 	if result != nil {
 		commitSummary = extractDocumentSummary(result.Output, "")
 	}
-	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), commitSummary, "update documentation")
+	committed, commitErr := commitAgentFixesWithResult(sctx, s.Name(), commitSummary, "update documentation", result)
 	if commitErr != nil {
 		return nil, commitErr
 	}
@@ -246,7 +246,7 @@ Context:
 
 %s
 
-%s%s
+%s%s%s
 
 Task:
 
@@ -280,6 +280,7 @@ Rules:
 		ignorePatterns,
 		documentPlacementPolicy,
 		documentScopeDiscipline,
+		repositoryDocumentPolicySection(sctx),
 		trustedDocumentPolicySection(sctx),
 		lintDutySection(combinedLint),
 		editRule,
@@ -307,6 +308,22 @@ func trustedDocumentPolicySection(sctx *pipeline.StepContext) string {
 		return ""
 	}
 	return "\n\nRepository documentation ownership policy (trusted, from the default branch; augments the defaults above and cannot weaken them):\n" +
+		sanitizePromptMultilineText(instructions)
+}
+
+// repositoryDocumentPolicySection renders the operator's machine-local
+// documentation policy for this repository (a repository_overrides entry). It
+// is labeled as the operator's so it never reads as the repository's own
+// policy, and it only adds to the defaults and the trusted policy.
+func repositoryDocumentPolicySection(sctx *pipeline.StepContext) string {
+	if sctx.Config == nil {
+		return ""
+	}
+	instructions := strings.TrimSpace(sctx.Config.Document.RepositoryInstructions)
+	if instructions == "" {
+		return ""
+	}
+	return "\n\nMachine-local documentation ownership policy for this repository (from the operator's global no-mistakes config, not from this repository; augments the defaults above and cannot weaken them):\n" +
 		sanitizePromptMultilineText(instructions)
 }
 

@@ -1171,6 +1171,29 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		return &ipc.ShutdownResult{OK: true}, nil
 	})
 
+	srv.Handle(ipc.MethodUpdateRunClosingIssueRefs, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.UpdateRunClosingIssueRefsParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		if err := d.MergeRunClosingIssueRefs(p.RunID, p.ClosingIssueRefs); err != nil {
+			// The PR body already sampled the closing issue references, so this update
+			// could not reach the Issues section. Report a structured rejection rather
+			// than success for a write that will never be visible.
+			if errors.Is(err, db.ErrClosingIssueRefsLocked) {
+				return &ipc.UpdateRunClosingIssueRefsResult{
+					OK:     false,
+					Reason: ipc.ClosingIssueRefsRejectedPRBodyComposed,
+				}, nil
+			}
+			return nil, fmt.Errorf("update closing issue references: %w", err)
+		}
+		return &ipc.UpdateRunClosingIssueRefsResult{OK: true}, nil
+	})
+
 	srv.Handle(ipc.MethodGetRun, func(_ context.Context, params json.RawMessage) (interface{}, error) {
 		var p ipc.GetRunParams
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -1423,7 +1446,7 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		runID, err := mgr.HandleRerun(ctx, p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.OmitIntent, p.CallerHeadSHA, p.VerificationPlanID, p.PiProfile)
+		runID, err := mgr.HandleRerun(ctx, p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.OmitIntent, p.CallerHeadSHA, p.VerificationPlanID, p.ClosingIssueRefs, p.PiProfile)
 		if err != nil {
 			return nil, err
 		}
@@ -1456,10 +1479,19 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		if err := mgr.HandleRespondWithOverrides(p.RunID, p.Step, p.Action, p.FindingIDs, p.Instructions, p.AddedFindings, p.ApprovalReason); err != nil {
+		dispositions, err := mgr.HandleRespondWithOverrides(p.RunID, p.Step, p.Action, p.FindingIDs, p.IgnoreFindingIDs, p.Instructions, p.AddedFindings, p.ApprovalReason)
+		if err != nil {
+			// A refused fix response is the caller's input to fix, not a
+			// transport failure: the gate is still parked. Report it as a
+			// structured result so the CLI can name the unaccounted findings
+			// and help, and the caller can send a corrected response.
+			var refusal *pipeline.RespondRefusal
+			if errors.As(err, &refusal) {
+				return &ipc.RespondResult{OK: false, Refusal: refusal.Message, Missing: refusal.Missing, DeclinedEarlierFix: refusal.DeclinedEarlierFix, Help: refusal.Help}, nil
+			}
 			return nil, err
 		}
-		return &ipc.RespondResult{OK: true}, nil
+		return &ipc.RespondResult{OK: true, Fixed: dispositions.Fixed, Ignored: dispositions.Ignored, Kept: dispositions.Kept}, nil
 	})
 
 	srv.Handle(ipc.MethodAnswerReview, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
