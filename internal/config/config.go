@@ -338,9 +338,11 @@ type OperatorReviewRaw struct {
 	PathInstructions []PathInstruction `yaml:"path_instructions"`
 }
 
-// RepositoryPRRaw contains machine-local per-repository PR title settings.
+// RepositoryPRRaw contains machine-local per-repository PR defaults.
 type RepositoryPRRaw struct {
 	TitleFormat *string `yaml:"title_format"`
+	Template    string  `yaml:"template"`
+	Appendix    string  `yaml:"appendix"`
 }
 
 // RepositoryOverrides maps remote URLs to machine-local per-repository settings.
@@ -684,6 +686,8 @@ type CIRaw struct {
 	ReviewBotComments string `yaml:"review_bot_comments"`
 	// RebaseBehind is a pointer for the same reason as RevalidateRepairs.
 	RebaseBehind *bool `yaml:"rebase_behind"`
+	// CarryReviewOnReplay is a pointer for the same reason as RevalidateRepairs.
+	CarryReviewOnReplay *bool `yaml:"carry_review_on_replay"`
 }
 
 // CI holds the resolved CI-step settings.
@@ -742,6 +746,20 @@ type CI struct {
 	// a green BEHIND PR reports checks-passed and waits for a human to bring
 	// it up to date (see VISION.md's cost rule).
 	RebaseBehind bool
+	// CarryReviewOnReplay opts a CI rebase repair that is a provable pure
+	// replay into keeping the run's review approval: when the repaired head
+	// is the reviewed commits replayed onto the resolved base tip - a linear
+	// chain of the same length, each commit replaying onto its new parent with
+	// no conflict to exactly its recorded tree, and each one patch-identical
+	// (`git patch-id --verbatim`) to the reviewed commit it replaced - the
+	// approval moves to the replayed head and validation restarts at Test
+	// instead of Review. Anything that fails any part of that proof, or any
+	// error while checking it, takes today's path and revalidates from Review.
+	//
+	// Off by default. It has no effect when RevalidateRepairs is true, which
+	// keeps meaning "every repair re-passes Review", or when the run has a
+	// review-anchored gate, which would otherwise be skipped for the new head.
+	CarryReviewOnReplay bool
 }
 
 // RebaseRaw is the YAML representation of rebase-step settings.
@@ -1105,6 +1123,9 @@ type EvidenceRaw struct {
 	// EffectiveRepoConfig): a contributor's pushed branch must not be able to
 	// aim evidence commits at another branch of the repository.
 	Branch *string `yaml:"branch"`
+	// CommitMessage templates the evidence-branch commit subject. Like
+	// commit.fix_message it only shapes a message, so it is pushed-readable.
+	CommitMessage *string `yaml:"commit_message"`
 	// LocalRoot, Retention, and MaxRuns describe this MACHINE's evidence
 	// storage: where the daemon writes artifacts on local disk and how long it
 	// keeps them. They are global-only - Merge resolves them straight from
@@ -1144,6 +1165,9 @@ type Evidence struct {
 	AttachMedia bool
 	Dir         string
 	Branch      string
+	// CommitMessage is the configured subject template; empty keeps the
+	// built-in subject (see RenderCommitMessage).
+	CommitMessage string
 	// LocalRoot overrides the app-root default for on-disk evidence; empty
 	// means paths.EvidenceDir(). Retention and MaxRuns bound how much of it
 	// survives: no-mistakes reaps its own evidence rather than leaving that to
@@ -1553,8 +1577,19 @@ ci:
   # pass. A repository that sets ci.rebase_behind on its own default branch
   # overrides this value.
   rebase_behind: false
+  # Whether a CI rebase repair that only replayed the reviewed commits keeps
+  # its review approval. Defaults to false: every rebase repair revalidates
+  # from Review. Set true to restart at Test instead when the rebase is a
+  # provable pure replay - every reviewed commit replayed without a conflict
+  # and patch-identical to the one it replaced. Anything else still
+  # revalidates from Review. No effect when revalidate_repairs is true. A
+  # repository that sets ci.carry_review_on_replay on its own default branch
+  # overrides this value.
+  carry_review_on_replay: false
 
 # Auto-fix commit subject template. Available variables: {{.Step}}, {{.Summary}}, and {{.Branch}}.
+# When set to anything but the default, it also renders the Push step's
+# catch-all commit (step "push", summary "apply agent fixes").
 # {{.Branch}} is the normalized branch name, or the only capture group from
 # branch_pattern when configured. A branch pattern with no match fails safely.
 # Global-only branch_replacement can add literal text around that group with ${1}.
@@ -1601,12 +1636,15 @@ intent:
 # directory to another disk and must be an absolute path. These three are
 # global-only - a repository's .no-mistakes.yaml cannot change where this
 # machine writes evidence or how long it keeps it.
+# commit_message templates the evidence-branch commit subject with
+# {{.Branch}} and {{.RunID}}; it follows commit.fix_message's template rules.
 # test:
 #   evidence:
 #     store_in_repo: true
 #     attach_media: true
 #     dir: .no-mistakes/evidence
 #     branch: no-mistakes/evidence
+#     commit_message: "no-mistakes: evidence for {{.Branch}} (run {{.RunID}})"
 #     local_root: /var/lib/no-mistakes/evidence
 #     retention: 720h
 #     max_runs: 50
@@ -3050,6 +3088,9 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// ci.review_bot_comments decides whether a green review-bot check
 		// can still block checks-passed, so a pushed branch must not be able
 		// to silence the bot's unresolved comments on itself.
+		// ci.carry_review_on_replay decides whether a rebased head may skip
+		// Review, so a pushed branch must not be able to opt its own rebases
+		// out of the maintainer's review.
 		effective.CI = trusted.CI
 		// rebase.strategy is gate-control in the same sense no_ci is. It decides
 		// whether integrating a moved base leaves an auditable merge commit
@@ -3062,7 +3103,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// test.evidence.branch names the git ref evidence commits are pushed
 		// to with the maintainer's credentials. It is trusted-only so a pushed
 		// branch cannot aim them at another branch of the repository; the rest
-		// of test.evidence (store_in_repo, attach_media, dir) stays
+		// of test.evidence (store_in_repo, attach_media, dir, commit_message) stays
 		// pushed-readable because it only picks how artifacts are published.
 		// The publisher independently refuses any branch without its marker
 		// file, and the upload client refuses Actions/App installation tokens,
@@ -3225,6 +3266,9 @@ func applyTestOverrides(dst *Test, src *TestRaw) {
 			dst.Evidence.Branch = branch
 		}
 	}
+	if src.Evidence.CommitMessage != nil {
+		dst.Evidence.CommitMessage = *src.Evidence.CommitMessage
+	}
 }
 
 // applyEvidenceStorageOverrides applies the global-only local-storage half of
@@ -3377,6 +3421,11 @@ func validateTestRaw(test TestRaw) error {
 			return fmt.Errorf("test.evidence.branch: %w", err)
 		}
 	}
+	if test.Evidence.CommitMessage != nil {
+		if _, err := renderEvidenceMessage(*test.Evidence.CommitMessage, "branch", "run"); err != nil {
+			return err
+		}
+	}
 	// local_root must be absolute. The daemon's working directory is a bare
 	// gate repository, so a relative path would resolve somewhere the operator
 	// never named - and evidence would silently scatter instead of landing
@@ -3494,6 +3543,9 @@ func applyCIOverrides(dst *CI, src *CIRaw) {
 	}
 	if src.RebaseBehind != nil {
 		dst.RebaseBehind = *src.RebaseBehind
+	}
+	if src.CarryReviewOnReplay != nil {
+		dst.CarryReviewOnReplay = *src.CarryReviewOnReplay
 	}
 }
 
@@ -3670,8 +3722,16 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		PublishIntent: repo.PR.PublishIntent,
 		Appendix:      repo.PR.Appendix,
 	}
-	if override != nil && override.PR.TitleFormat != nil {
-		pr.TitleFormat = *override.PR.TitleFormat
+	if override != nil {
+		if override.PR.TitleFormat != nil {
+			pr.TitleFormat = *override.PR.TitleFormat
+		}
+		if pr.Template == "" {
+			pr.Template = override.PR.Template
+		}
+		if pr.Appendix == "" {
+			pr.Appendix = override.PR.Appendix
+		}
 	}
 	if repo.PR.TitleFormat != nil {
 		pr.TitleFormat = *repo.PR.TitleFormat
