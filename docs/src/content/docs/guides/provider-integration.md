@@ -44,7 +44,7 @@ Once the host is wired up, `no-mistakes` can keep owning the branch after it
 pushes to the configured target:
 
 - create or update the PR automatically
-- keep polling hosted CI until the PR is merged, closed, declined, or the configured `ci_timeout` idle window elapses
+- poll hosted CI according to the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - fetch failing job logs for the CI auto-fix loop when the provider exposes them
 - on GitHub, GitLab, Forgejo, Azure DevOps, Cursor Origin, and provider plugins that declare `mergeable_state`, watch mergeability and fix merge conflicts when possible
 
@@ -72,17 +72,18 @@ gh auth status
 
 `no-mistakes doctor` also checks for `gh` availability.
 For PR and workflow-run commands, no-mistakes passes the repository slug from the recorded upstream remote or PR URL to `gh`, so daemon-run commands do not depend on the daemon's current working directory.
+Rewriting an existing PR's title or body (the attestation rebind before a push, the PR step's update) uses a REST `PATCH` through `gh api` rather than `gh pr edit`, so a token limited to the `repo` and `workflow` scopes is enough. `gh pr edit` looks the PR up over GraphQL with team fields that need `read:org`.
 
 ### Multiple GitHub or GitLab identities
 
-If one daemon serves repositories that require non-overlapping accounts, give each account an isolated CLI config directory and use account-specific host aliases in repository remotes, for example `git@github-personal:you/project.git`. Then map those raw host tokens with global [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles). The reference owns the configuration, validation, compatibility, and fail-closed routing contract.
+If one daemon serves repositories that require non-overlapping accounts, give each account an isolated CLI config directory and use account-specific host aliases in repository remotes, for example `git@github-personal:you/project.git`. Then map those raw host tokens with global [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles). When the accounts are already signed in to one gh configuration, a GitHub profile keyed by `host/owner` with `gh_user` selects the login per repository owner instead, with no extra config directory or alias. The reference owns the configuration, validation, compatibility, and fail-closed routing contract.
 
 **What you get:**
 
 - PR creation and update on pushes
-- CI check polling with exponential backoff (30s → 60s → 120s) until the PR is merged, closed, or the configured `ci_timeout` idle window elapses
+- CI polling follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed job log fetching (`gh run view --log-failed`) for the CI auto-fix step
-- A red Greptile check parked as `ask-user` CI findings carrying its unresolved review-thread comments, which are also supplied to CI repair prompts (a green or not-yet-registered one too under [`ci.review_bot_comments: always`](/no-mistakes/reference/repo-config/#cireview_bot_comments)); see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) for filtering and prompt-safety details
+- A red Greptile check, or a CodeRabbit check opted in through [`ci.required_reviews`](/no-mistakes/reference/repo-config/#cirequired_reviews), parked as `ask-user` CI findings carrying its unresolved review-thread comments, which are also supplied to CI repair prompts (a green or not-yet-registered one too under [`ci.review_bot_comments: always`](/no-mistakes/reference/repo-config/#cireview_bot_comments)); see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) for filtering and prompt-safety details
 - PR mergeability polling, and agent-driven resolution when the provider reports an actual merge conflict
 
 ### GitHub fork contributions
@@ -124,7 +125,7 @@ glab auth login
 **What you get:**
 
 - PR (merge request) creation and update
-- CI pipeline status polling until the merge request is merged, closed, or the configured `ci_timeout` idle window elapses
+- CI polling follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed job trace fetching (`glab ci trace`) for the CI auto-fix step
 - Merge-conflict polling and auto-fix, same as GitHub
 - A supported review bot's unresolved merge request discussion notes as `ask-user` CI findings under [`ci.review_bot_comments: always`](/no-mistakes/reference/repo-config/#cireview_bot_comments) (see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) for the identity and filtering rules)
@@ -167,7 +168,7 @@ Get an API token from [Bitbucket account settings](https://bitbucket.org/account
 **What you get:**
 
 - PR creation and update
-- CI pipeline status polling until the PR is merged, declined, or the configured `ci_timeout` idle window elapses
+- CI polling follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed pipeline step log fetching for the CI auto-fix step
 
 **What you don't get (yet):**
@@ -213,8 +214,9 @@ well as their SSH forms (`git@ssh.dev.azure.com:v3/...`).
   [`pr.template`](/no-mistakes/reference/repo-config/#prtemplate) for
   author-preserving publication and its provider limits.
 - CI status polling - Azure branch policy evaluations (build validation and
-  status checks) are read via `az repos pr policy list` until the PR is
-  completed, abandoned, or the configured `ci_timeout` idle window elapses
+  status checks) are read via `az repos pr policy list` while the CI monitor is
+  active; see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci)
+  for its lifecycle and handoff controls
 - Merge-conflict polling and auto-fix from the PR's `mergeStatus`
 
 **What you don't get (yet):**
@@ -225,27 +227,27 @@ well as their SSH forms (`git@ssh.dev.azure.com:v3/...`).
 
 ## Gitea
 
-Gitea uses `tea`, its official CLI. Install it and log in with a token:
+Gitea uses `tea`, its official CLI. Both the released tea 0.x line and the tea 1.0 rewrite ([gitea/tea#1126](https://gitea.com/gitea/tea/pulls/1126)) work; no-mistakes detects which one is installed. Install it and log in with a token:
 
 ```sh
 # see https://gitea.com/gitea/tea for install options (Homebrew, packages, or a release binary)
 
+# tea 0.x
 tea logins add --url https://your-gitea.example.com --token your-token --name your-instance
+
+# tea 1.0 (reads the token from stdin)
+tea auth login --host https://your-gitea.example.com --with-token < token-file
 ```
 
-Create a token from **Settings → Applications → Manage Access Tokens** on your Gitea instance, with read/write `repository` and `issue` scopes.
+Create a token from **Settings → Applications → Manage Access Tokens** on your Gitea instance, with read/write `repository` and `issue` scopes. tea 1.0 does not read tea 0.x logins, so log in again after upgrading (see tea's `docs/migration-1.0.md`).
 
-Verify:
-
-```sh
-tea logins list
-```
+Verify with `tea logins list` (tea 0.x) or `tea auth status` (tea 1.0).
 
 **What you get:**
 
-- PR creation and update (`tea pulls create`/`edit`)
-- CI status polling through Gitea Actions until the PR is merged or closed, or the configured `ci_timeout` idle window elapses. Job-level pass/fail comes from Gitea's Actions REST API (`GET .../actions/runs/{run}/jobs`), reached through `tea api` (which reuses the same stored login/token, so no separate HTTP client or credential is needed) - `tea`'s own `--output json` on `actions runs view --jobs` reports each job's run/queued/completed status but not its pass/fail conclusion.
-- Failed job log fetching (`tea actions runs logs`) for the CI auto-fix step
+- PR creation and update (`tea pulls create`/`edit` on tea 0.x, `tea pr create`/`edit` on tea 1.0)
+- CI status polling through Gitea Actions follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci). Job-level pass/fail comes from Gitea's Actions REST API (`GET .../actions/runs/{run}/jobs`), reached through `tea api` (which reuses the same stored login/token, so no separate HTTP client or credential is needed) - `tea`'s own `--output json` on `actions runs view --jobs` reports each job's run/queued/completed status but not its pass/fail conclusion.
+- Failed job log fetching (`tea actions runs logs`, or `tea run logs` on tea 1.0) for the CI auto-fix step
 
 **What you don't get (yet):**
 
@@ -257,11 +259,11 @@ Gitea Actions shipped in Gitea 1.19 (2023); older instances have no Actions API 
 
 ### Self-hosted Gitea
 
-Nearly every real Gitea instance is self-hosted at an arbitrary hostname with no `gitea` marker in it at all, so detection cannot use a substring match the way `gitlab.com`/`github.com` do. Instead, `no-mistakes` consults `tea`'s own login config (`config.yml`, under `$XDG_CONFIG_HOME/tea` or `~/.config/tea`) and treats the upstream as Gitea if its host matches a configured login's `url` or `ssh_host`.
+Nearly every real Gitea instance is self-hosted at an arbitrary hostname with no `gitea` marker in it at all, so detection cannot use a substring match the way `gitlab.com`/`github.com` do. Instead, `no-mistakes` consults `tea`'s own config and treats the upstream as Gitea if its host matches a tea 0.x login's `url` or `ssh_host` in `config.yml` (under `$XDG_CONFIG_HOME/tea` or `~/.config/tea`), or a tea 1.0 instance's URL or `ssh_host` in `hosts.yml` (under `$TEA_CONFIG_DIR`, else the same directory).
 
-Running `tea logins add --url https://your-gitea.example.com --token <token> --name <name>` is enough to make detection succeed; if `tea` has no login for the host, detection fails closed and the upstream is treated as unsupported.
+Logging in as shown above is enough to make detection succeed; if `tea` has no login for the host, detection fails closed and the upstream is treated as unsupported. Two tea 1.0 instances on one hostname (different ports or base paths) are ambiguous and also fail closed.
 
-Because `tea` infers "which instance" from the current directory's git remote - context the daemon's detached worktree does not have - every `tea` invocation `no-mistakes` makes carries `--login <name>` explicitly, resolved from the matched login's name at request time.
+Because `tea` infers "which instance" from the current directory's git remote - context the daemon's detached worktree does not have - every `tea` invocation `no-mistakes` makes selects the account explicitly: `--login <name>` on tea 0.x, `--host <instance url>` on tea 1.0, resolved from the matched config entry. The tea generation is detected once, with a side-effect-free `--help` probe; a `tea` binary that matches neither generation is never guessed at: the step is skipped with an `unrecognized tea CLI` reason, the same way a logged-out CLI is, and so is a tea 1.0 binary with no tea 1.0 login for the host.
 
 ## Cursor Origin
 
@@ -283,8 +285,7 @@ origin auth status
 - PR creation and update (`origin pr create` / `origin pr edit`). The Origin CLI
   defaults new changes to draft; no-mistakes always passes `--status` explicitly
   (`open` unless `providers.origin.draft_pull_requests` is true).
-- CI check polling through `origin pr checks` until the PR is merged or closed,
-  or the configured `ci_timeout` idle window elapses.
+- CI check polling through `origin pr checks` while the monitor is active; see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) for its lifecycle.
 - Mergeability polling from `origin pr view --json mergeability`, and
   merge-conflict auto-fix when Origin reports `hasMergeConflicts`, conflicted
   paths, or a conflict verdict under the nested `mergeability.mergeability`.
@@ -318,6 +319,8 @@ The fork owner extracted from the fork URL keeps the plain `owner/name` form bec
 Self-hosted GitLab is detected out of the box even when the hostname carries no `gitlab` marker (for example `git.example.com`).
 When the hostname is not obviously GitLab, `no-mistakes` consults glab's configured hosts (`config.yml`, honoring `GLAB_CONFIG_DIR` then `XDG_CONFIG_HOME/glab-cli`, then `~/.config/glab-cli`) and treats the upstream as GitLab if its host appears there as a configured host or `api_host`.
 Running `glab auth login --hostname your-gitlab.example.com` is enough to make detection succeed; if glab is not configured for the host, detection fails closed and the upstream is treated as unsupported.
+
+If GitLab serves SSH and web/API traffic on different hosts, configure glab's global `api_host` for the Git remote's host. See the [MR URL validation contract](/no-mistakes/reference/pipeline-steps/#pr) for how existing-MR discovery and review-comment reads authorize the alternate web host.
 
 The GitLab backend is pinned against `glab v1.5x`. Self-hosted detection and the merge-request and CI steps rely on its current flag and API surface, so keep `glab` reasonably up to date.
 
@@ -353,7 +356,7 @@ PR retargeting are optional capabilities the plugin declares in `status`.
 **What you get:**
 
 - PR creation and update, including [`pr.template`](/no-mistakes/reference/repo-config/#prtemplate) and pre-push attestation
-- CI check polling until the PR is merged or closed, or the configured `ci_timeout` idle window elapses
+- CI polling follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed-check log fetching, mergeability polling, merge-conflict auto-fix, and merged-at-head proof, when the plugin declares them
 
 **What you don't get:**
@@ -387,7 +390,7 @@ Everything before push (rebase, review, test, document, lint) still works regard
 no-mistakes doctor
 ```
 
-`doctor` checks `gh`, `az`, and `origin` availability. It also validates every configured forge profile, including its provider config, target host, and online authentication, and checks that every configured provider plugin's command resolves. Without profiles, confirm `glab` is installed and authenticated for GitLab. For Forgejo, run `FORGEJO_BASE_URL=<host> forgejo-axi status --json` from the daemon's environment. For Bitbucket Cloud, confirm the two env vars are set in that environment. For Azure DevOps, confirm the `azure-devops` extension is installed (`az extension show --name azure-devops`) and a PAT is available. For Gitea, confirm `tea` is installed and has a login configured for your instance (`tea logins list`). For Cursor Origin, confirm `origin auth status` succeeds.
+`doctor` checks `gh`, `az`, and `origin` availability. It also validates every configured forge profile, including its provider config, target host, and online authentication, and checks that every configured provider plugin's command resolves. Without profiles, confirm `glab` is installed and authenticated for GitLab. For Forgejo, run `FORGEJO_BASE_URL=<host> forgejo-axi status --json` from the daemon's environment. For Bitbucket Cloud, confirm the two env vars are set in that environment. For Azure DevOps, confirm the `azure-devops` extension is installed (`az extension show --name azure-devops`) and a PAT is available. For Gitea, confirm `tea` is installed and has a login configured for your instance (`tea logins list` on tea 0.x, `tea auth status` on tea 1.0). For Cursor Origin, confirm `origin auth status` succeeds.
 
 :::note
 Provider CLIs and credentials inherit the daemon's startup environment. If credentials or PATH-derived tools are missing, check `~/.no-mistakes/logs/daemon.log` for a login-shell environment resolution warning, then see [Environment the daemon sees](/no-mistakes/reference/environment/#environment-the-daemon-sees) for the platform-specific resolution and restart behavior.

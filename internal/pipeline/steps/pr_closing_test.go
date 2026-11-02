@@ -200,7 +200,7 @@ func TestPRTemplate_ClosesRendersOnceAcrossCreateAndAuthorEditedUpdate(t *testin
 func TestPROwnershipUpdateRecomputesIssuesFromLatestAuthorText(t *testing.T) {
 	t.Parallel()
 	_, appendix := ownedFixture(t)
-	content, err := composeOwnedPRContent(prOwnedBody{before: "## Summary\n\nFixes #95"}, "", appendix, 0)
+	content, err := composeOwnedPRContent(prOwnedBody{before: "## Summary\n\nFixes #95"}, "", appendix, 0, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestPROwnershipUpdateRecomputesIssuesFromLatestAuthorText(t *testing.T) {
 		return nil
 	}}
 	sctx := &pipeline.StepContext{Ctx: context.Background(), ClosingIssueRefs: []string{"95"}}
-	if err := updateOwnedPR(sctx, host, &scm.PR{Number: "42"}, scm.PRContent(content), "", "", appendix, 0); err != nil {
+	if err := updateOwnedPR(sctx, host, &scm.PR{Number: "42"}, scm.PRContent{Title: content.Title, Body: content.Body}, "", "", appendix, 0); err != nil {
 		t.Fatal(err)
 	}
 	if host.writes != 1 || strings.Contains(host.body, "Fixes #95") || strings.Count(host.body, "Closes #95") != 1 {

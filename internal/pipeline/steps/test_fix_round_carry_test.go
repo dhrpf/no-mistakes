@@ -242,8 +242,10 @@ func testDeferredAskUserFindingParksUntilAHumanDecidesIt(t *testing.T, severity,
 		if call == 1 {
 			return &agent.Result{Output: json.RawMessage(`{"summary":"broken","findings":[{"id":"intent-check","severity":"` + severity + `","action":"ask-user","description":"` + question + `"}],"tested":["x"],"testing_summary":"failed","artifacts":[],"scenarios":[{"name":"user runs the command","result":"fail","live":true,"evidence":"x","reason":""}],"verdict":"no-go"}`)}, nil
 		}
-		if err := os.WriteFile(filepath.Join(dir, "fix.txt"), []byte(fmt.Sprint("fix ", call)), 0o644); err != nil {
-			return nil, err
+		if call == 2 {
+			if err := os.WriteFile(filepath.Join(dir, "fix.txt"), []byte(fmt.Sprint("fix ", call)), 0o644); err != nil {
+				return nil, err
+			}
 		}
 		if call == 3 && reportedAction != "" {
 			reported := `[{"id":"intent-check","severity":"` + severity + `","action":"` + reportedAction + `","description":"` + question + `"}]`

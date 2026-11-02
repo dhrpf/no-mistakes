@@ -149,7 +149,11 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			forkRepo = github.RepoSlug(sctx.Repo.ForkURL)
 		}
 		draft := sctx.Config != nil && sctx.Config.Providers.GitHub.DraftPullRequests
-		return github.NewWithFork(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, host, repo, forkRepo, draft), ""
+		gh := github.NewWithFork(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, host, repo, forkRepo, draft)
+		if sctx.Config != nil {
+			gh.WithRequiredReviews(sctx.Config.CI.RequiredReviews, sctx.Config.CI.RequiredReviewAppID)
+		}
+		return gh, ""
 	case scm.ProviderGitLab:
 		if sctx.Repo.ForkURL != "" {
 			// Fork MR routing for GitLab is intentionally not half-wired.
@@ -158,13 +162,17 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			return nil, "fork PR routing for GitLab is not implemented"
 		}
 		draft := sctx.Config != nil && sctx.Config.Providers.GitLab.DraftPullRequests
-		return gitlab.NewWithDraft(
+		host := gitlab.NewWithDraft(
 			cmdFactory,
 			func() bool { return stepCLIAvailable(sctx, provider) },
 			resolvedHost(sctx, sctx.Repo.UpstreamURL),
 			gitlab.ProjectPath(sctx.Repo.UpstreamURL),
 			draft,
-		), ""
+		)
+		if sctx.Config != nil {
+			host.WithRequiredReviews(sctx.Config.CI.RequiredReviews, sctx.Config.CI.RequiredReviewBotID)
+		}
+		return host, ""
 	case scm.ProviderBitbucket:
 		if sctx.Repo.ForkURL != "" {
 			// Fork PR routing for Bitbucket is intentionally not half-wired.
@@ -239,11 +247,11 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 		if repoSlug == "" {
 			return nil, "could not resolve Gitea owner/repo from the remote URL"
 		}
-		// login comes from tea's own config.yml (see scm.ResolveGiteaLogin); an
-		// empty login is tolerated here and surfaces as an actionable error
+		// The account comes from tea's own config (see scm.ResolveTeaAccount);
+		// a missing one is tolerated here and surfaces as an actionable error
 		// from Host.Available instead of failing host construction outright.
-		login := scm.ResolveGiteaLogin(host)
-		return gitea.New(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, host, login, repoSlug), ""
+		account := scm.ResolveTeaAccount(host)
+		return gitea.New(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, host, account, repoSlug), ""
 	case scm.ProviderOrigin:
 		if sctx.Repo.ForkURL != "" {
 			return nil, "fork PR routing for Cursor Origin is not implemented"

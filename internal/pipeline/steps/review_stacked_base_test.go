@@ -34,7 +34,7 @@ func TestReviewStep_UsesRunPRBaseBranchForDiff(t *testing.T) {
 	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
 
 	ag := &mockAgent{name: "test", runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
-		return &agent.Result{Output: json.RawMessage(`{"findings":[],"risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`)}, nil
+		return &agent.Result{Output: json.RawMessage(`{"findings":[],"reviewed_paths":["stacked-feature.txt"],"risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`)}, nil
 	}}
 	sctx := newTestContextWithDBRecords(t, ag, dir, mainBaseSHA, headSHA, config.Commands{})
 	baseBranch := "stacked-base"
