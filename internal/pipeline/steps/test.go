@@ -51,6 +51,14 @@ func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	if err != nil {
 		return nil, err
 	}
+	logUnknownTestKeys(sctx)
+	// Resolved before any turn or command so a trusted guidance file that
+	// cannot be read fails the step before it spends anything. The evidence
+	// turn re-resolves it only when a repair moved the head.
+	runbookSections, err := testRunbookSections(sctx, baseSHA)
+	if err != nil {
+		return nil, err
+	}
 
 	// Agent-only preparation is an explicit eager opt-in, not a claim from
 	// the agent that dependencies exist. Use the same worktree receipt and
@@ -97,6 +105,7 @@ Rules:
 - Make the smallest correct root-cause fix.
 - Do not refactor beyond what is needed for that root-cause fix.
 - If tests fail, determine whether the problem is a real product/code failure, a setup/environment problem you can fix, or a flaky/infrastructure issue.
+- Inspect specific environment variables by name if you need them; do not print the whole environment (env, printenv, set, export -p, or similar), because this transcript is persisted.
 - Do NOT run linters, formatters, or static analysis tools.
 - Reproduce the specific failing case first (the exact test, package, script, or check named in the findings), then re-run only that focused verification after the fix.
 - Await every required check and read its actual exit status. Stop disposable browser and server children before returning success. Report incomplete verification honestly.
@@ -109,7 +118,7 @@ Rules:
 			sctx.Run.Branch,
 			baseSHA,
 			sctx.Run.HeadSHA,
-			testRunbookSections(sctx),
+			runbookSections,
 			fixSummaryRules(sctx, s.Name()),
 			historySection,
 		) + testRepairScopeRules
@@ -240,7 +249,12 @@ Previous test findings to address:
 	if declaration := commandOverrideDeclaration("test", sctx.Config.CommandOverrides["test"]); declaration != "" && len(baselineResults) > 0 {
 		configuredTestCommand += fmt.Sprintf("Baseline ran with %s. Declare these overrides in testing_summary.\n", declaration)
 	}
-	runbook := testRunbookSections(sctx) + budgetCutGuidanceSection(sctx)
+	if sctx.Run.HeadSHA != startHead {
+		if runbookSections, err = testRunbookSections(sctx, baseSHA); err != nil {
+			return nil, err
+		}
+	}
+	runbook := runbookSections + budgetCutGuidanceSection(sctx)
 	fallbackGuidance := `- Never treat "do not run everything" as permission to run nothing: if no existing check drives a scenario, write or improve a focused test, perform manual verification with evidence, or report a warning finding that sufficient targeted evidence is not possible.
 - If sufficient evidence is not possible, report a warning finding explaining what evidence is missing and why the user needs to decide what to do. When the blocker is a host capability or OS permission the agent's own process lacks (for example, the Screen Recording permission macOS requires to capture a native GUI application), name the specific capability or permission and how to grant it so the user can enable it and re-run, instead of retrying blindly or failing opaquely.`
 	if sctx.Run.VerificationPlan != nil {
@@ -305,6 +319,7 @@ Evidence:
 - Record the exact tests, manual checks, and evidence-producing steps you ran in a "tested" array. Prefer concrete commands or test selectors wrapped in backticks.
 - Always include an "artifacts" array. Leave it empty when you produced no reviewer-visible evidence artifacts. Use artifact path for file artifacts, artifact url for externally visible artifacts, and artifact content for short logs or command output that should be shown directly in the PR.
 - If a scenario fails, determine whether the problem is a real product/code failure, a setup/environment problem, or a flaky/infrastructure issue, and report which it is in the finding.
+- Inspect specific environment variables by name if you need them; do not print the whole environment (env, printenv, set, export -p, or similar), because this transcript is persisted.
 
 Rules:
 - Do NOT run linters, formatters, or static analysis tools.
@@ -503,24 +518,6 @@ Validation errors:
 	}
 	b.WriteString("\n")
 	return b.String()
-}
-
-// testRunbookSections renders the machine-local runbook ahead of the trusted
-// one, for both the repair and the evidence prompt.
-func testRunbookSections(sctx *pipeline.StepContext) string {
-	return repositoryTestInstructionsSection(sctx) + trustedTestInstructionsSection(sctx)
-}
-
-func trustedTestInstructionsSection(sctx *pipeline.StepContext) string {
-	if sctx.Config == nil {
-		return ""
-	}
-	instructions := strings.TrimSpace(sctx.Config.Test.Instructions)
-	if instructions == "" {
-		return ""
-	}
-	return "\nRepository live-validation runbook (trusted, from the default branch):\n" +
-		sanitizePromptMultilineText(instructions) + "\n"
 }
 
 // repositoryTestInstructionsSection renders the operator's machine-local

@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"maps"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -210,7 +211,8 @@ type GlobalConfig struct {
 	// run's quota evidence is read from.
 	QuotaProviders map[string]string `yaml:"-"`
 	// ReviewAgents selects independent review-loop harnesses and profiles.
-	// Global-only: repository input must not select credential/model profiles.
+	// Operator-only: a repository_overrides entry may replace roles for its
+	// remote, but repository config can never select credential/model profiles.
 	ReviewAgents map[string]ReviewAgent `yaml:"review_agents"`
 	// WorktreeRoots places a repository's pipeline run worktrees under a
 	// directory the operator chose instead of the default
@@ -250,6 +252,11 @@ type GlobalConfig struct {
 	GateReconcileInterval time.Duration `yaml:"-"`
 	GateReconcileTimeout  time.Duration `yaml:"-"`
 	LogLevel              string        `yaml:"log_level"`
+	// EvidenceDir is the global-only parent directory for new run evidence.
+	// Empty keeps <NM_HOME>/evidence (or test.evidence.local_root). A missing
+	// or unwritable value falls back to the app-root default at resolution
+	// time; already-pinned runs are not moved. A repository cannot set it.
+	EvidenceDir string `yaml:"evidence_dir"`
 	// SessionReuse controls per-run agent session reuse in the review loop:
 	// one durable fixer session across review-fix turns. Review turns always
 	// run session-free so the rereview never resumes the session whose
@@ -320,6 +327,7 @@ type globalConfigRaw struct {
 	ReviewAgentWorkingTimeout string                     `yaml:"review_agent_working_timeout"`
 	TestAgentWorkingTimeout   string                     `yaml:"test_agent_working_timeout"`
 	LogLevel                  string                     `yaml:"log_level"`
+	EvidenceDir               string                     `yaml:"evidence_dir"`
 	SessionReuse              *bool                      `yaml:"session_reuse"`
 	AutoFix                   AutoFixRaw                 `yaml:"auto_fix"`
 	CI                        CIRaw                      `yaml:"ci"`
@@ -377,13 +385,15 @@ func SplitForgeProfileKey(key string) (host, owner string) {
 // RepositoryOverride contains machine-local settings for one normalized remote.
 // Review, Document, and Test are additive guidance only: they are rendered
 // alongside the repository's trusted rules and can never replace or remove them.
+// ReviewAgents replaces the global review_agents entry for each role it names.
 type RepositoryOverride struct {
-	Commit   GlobalCommitRaw            `yaml:"commit"`
-	PR       RepositoryPRRaw            `yaml:"pr"`
-	Commands map[string]CommandOverride `yaml:"commands"`
-	Review   OperatorReviewRaw          `yaml:"review"`
-	Document DocumentRaw                `yaml:"document"`
-	Test     RepositoryTestRaw          `yaml:"test"`
+	Commit       GlobalCommitRaw            `yaml:"commit"`
+	PR           RepositoryPRRaw            `yaml:"pr"`
+	Commands     map[string]CommandOverride `yaml:"commands"`
+	Review       OperatorReviewRaw          `yaml:"review"`
+	Document     DocumentRaw                `yaml:"document"`
+	Test         RepositoryTestRaw          `yaml:"test"`
+	ReviewAgents map[string]ReviewAgent     `yaml:"review_agents"`
 }
 
 // RepositoryTestRaw is the test block a repository_overrides entry may set:
@@ -428,6 +438,12 @@ type RepoConfig struct {
 	// TrustedIgnorePatterns preserves the default branch's authorized exclusions
 	// when review instructions override exclusions from the pushed branch.
 	TrustedIgnorePatterns []string `yaml:"-"`
+	// UnknownTestKeys lists the keys under test: that this version does not
+	// recognize, as dotted paths (test.path_instruction). Parsing stays lenient
+	// so an existing config keeps working; the Test step reports them instead.
+	// EffectiveRepoConfig replaces it with source-labeled warnings for both
+	// copies.
+	UnknownTestKeys []string `yaml:"-"`
 	// ProtectedPaths prevents automatic staging of dirty matching paths. It is
 	// trusted-only, regardless of allow_repo_commands, so a pushed branch cannot
 	// remove the maintainer's protection from its own fixes.
@@ -451,6 +467,9 @@ type RepoConfig struct {
 	// pushed branch cannot opt its own integration out of the shape the
 	// maintainer chose.
 	Rebase RebaseRaw `yaml:"rebase"`
+	// Push reserves publication for an external publisher when declared paths
+	// match. It is trusted-only, regardless of allow_repo_commands.
+	Push   Push      `yaml:"push"`
 	Commit CommitRaw `yaml:"commit"`
 	Intent IntentRaw `yaml:"intent"`
 	Test   TestRaw   `yaml:"test"`
@@ -519,8 +538,27 @@ type DocumentRaw struct {
 	Instructions string `yaml:"instructions"`
 }
 
+// reviewFixRoundLimit rejects fractional YAML numbers instead of silently
+// truncating them to an integer budget.
+type reviewFixRoundLimit int
+
+func (l *reviewFixRoundLimit) UnmarshalYAML(node *yaml.Node) error {
+	if node.Tag != "!!int" {
+		return fmt.Errorf("review.max_fix_rounds must be a non-negative integer")
+	}
+	var value int
+	if err := node.Decode(&value); err != nil {
+		return fmt.Errorf("review.max_fix_rounds: %w", err)
+	}
+	*l = reviewFixRoundLimit(value)
+	return nil
+}
+
 // ReviewRaw is the YAML representation of review-step settings.
 type ReviewRaw struct {
+	// MaxFixRounds bounds all Review fix rounds, automatic and explicit.
+	// Zero preserves the unbounded default. Trusted repository config only.
+	MaxFixRounds reviewFixRoundLimit `yaml:"max_fix_rounds"`
 	// Conversation turns the review conversation on: the reviewer may emit the
 	// larger questions it cannot settle itself, keep reviewing while they are
 	// open, and be resumed with the answers. Off (the default), the review step
@@ -711,6 +749,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 		AutoFix                AutoFixRaw   `yaml:"auto_fix"`
 		CI                     CIRaw        `yaml:"ci"`
 		Rebase                 RebaseRaw    `yaml:"rebase"`
+		Push                   Push         `yaml:"push"`
 		Commit                 CommitRaw    `yaml:"commit"`
 		Intent                 IntentRaw    `yaml:"intent"`
 		Test                   TestRaw      `yaml:"test"`
@@ -735,6 +774,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.AutoFix = raw.AutoFix
 	c.CI = raw.CI
 	c.Rebase = raw.Rebase
+	c.Push = raw.Push
 	c.Commit = raw.Commit
 	c.Intent = raw.Intent
 	c.Test = raw.Test
@@ -790,6 +830,9 @@ type CIRaw struct {
 	// ReleaseAfterChecksPass is a pointer for the same reason as
 	// RevalidateRepairs: a repository must be able to opt back out.
 	ReleaseAfterChecksPass *bool `yaml:"release_after_checks_pass"`
+	// Instructions is repository-only guidance for the CI fixer; see
+	// CI.Instructions.
+	Instructions string `yaml:"instructions"`
 }
 
 // CI holds the resolved CI-step settings.
@@ -886,6 +929,10 @@ type CI struct {
 	// (see VISION.md's cost and consent rules). A trusted repository config may
 	// set it for its own workflow.
 	ReleaseAfterChecksPass bool
+	// Instructions is the trusted repository's guidance for the CI fixer,
+	// added to every CI repair prompt. It is trusted-only with the rest of the
+	// ci block, so a pushed branch cannot steer the agent repairing it.
+	Instructions string
 }
 
 // RebaseRaw is the YAML representation of rebase-step settings.
@@ -985,6 +1032,7 @@ type Config struct {
 	AutoFix        AutoFix
 	CI             CI
 	Rebase         Rebase
+	Push           Push
 	Commit         Commit
 	Intent         Intent
 	Test           Test
@@ -1128,6 +1176,8 @@ type Document struct {
 // decides whether the reviewer may ask questions while it works. The two
 // operator lists come from the global config and only ever add rules.
 type Review struct {
+	// MaxFixRounds is the opt-in total Review fix-round budget (0 = unlimited).
+	MaxFixRounds int
 	// Conversation is true when the reviewer may ask the operator questions
 	// mid-pass. It gates the whole protocol: the prompt section, the
 	// conversation files, the question findings that park the gate, the
@@ -1239,6 +1289,16 @@ type TestRaw struct {
 	// EffectiveRepoConfig): a contributor's pushed branch must not be able to
 	// rewrite the runbook the agent that validates it follows.
 	Instructions string `yaml:"instructions"`
+	// InstructionsFile is the file-backed form of Instructions: a literal
+	// repository-relative path the daemon reads as a tree entry of the pinned
+	// trusted default-branch commit, never from the pushed worktree. It is
+	// trusted-only like Instructions, and the two are mutually exclusive.
+	InstructionsFile string `yaml:"instructions_file"`
+	// PathInstructions scope extra live-validation guidance to the paths a
+	// change touches, like review.path_instructions does for Review. Each
+	// entry carries inline instructions or an instructions_file read from the
+	// pinned trusted commit. Trusted-only like Instructions.
+	PathInstructions []TestPathInstruction `yaml:"path_instructions"`
 	// AllowApproveOverFailure is the recorded reason that opts this
 	// repository into letting require-no-mistakes accept a Test step that
 	// was approved over a failing configured commands.test. Empty (the default)
@@ -1257,8 +1317,9 @@ type EvidenceRaw struct {
 	// Compact controls PR testing-section presentation only; pushed-readable.
 	Compact *bool `yaml:"compact"`
 	// AttachMedia uploads image and video evidence to GitHub user-attachments
-	// when the PR body is rendered. It defaults on so default-config PRs stop
-	// citing local disk paths for screenshots; set false to opt out even when
+	// and images to GitLab project uploads when explicitly enabled. It defaults
+	// on for GitHub so default-config PRs stop citing local disk paths for
+	// screenshots; set false to opt out even when
 	// store_in_repo is true. The orphan-branch store is independent: when both
 	// are on, the PR body carries both the commit-pinned link and the attachment.
 	// Like store_in_repo, this is pushed-readable.
@@ -1286,6 +1347,17 @@ type EvidenceRaw struct {
 	LocalRoot *string `yaml:"local_root"`
 	Retention *string `yaml:"retention"`
 	MaxRuns   *int    `yaml:"max_runs"`
+	// LinkBaseURL links structured local evidence references for an operator
+	// who serves their evidence parent
+	// (evidence_dir or local_root) over HTTP themselves. Unset keeps today's
+	// local-path rendering byte for byte. It is global-only for the same
+	// reason as LocalRoot: a pushed branch must never choose where a PR's
+	// evidence links point, so Merge resolves it from GlobalConfig alone and
+	// a repository value is IGNORED, never refused at parse time: the round
+	// provenance record serializes the effective RepoConfig and reads it back
+	// through LoadRepoFromBytes, so an earlier draft that refused the key by
+	// name broke eval capture for every run.
+	LinkBaseURL *string `yaml:"link_base_url"`
 }
 
 // Test is the resolved test-step config. Prepare, BaseAttribution,
@@ -1301,6 +1373,15 @@ type Test struct {
 	// the repository's remote and are rendered before, never instead of,
 	// Instructions.
 	RepositoryInstructions string
+	// InstructionsFile and PathInstructions come from the trusted
+	// default-branch repo config only. The Test step reads every
+	// instructions_file from the pinned trusted commit (TrustedConfigSHA).
+	InstructionsFile string
+	PathInstructions []TestPathInstruction
+	// UnknownKeys names keys under test: that no-mistakes does not recognize,
+	// in either copy of .no-mistakes.yaml. They have no effect; the Test step
+	// logs them so a misspelled or unsupported key does not go unnoticed.
+	UnknownKeys []string
 }
 
 // Evidence is the resolved test-evidence config. When StoreInRepo is true, the
@@ -1316,8 +1397,13 @@ type Evidence struct {
 	Compact     bool
 	StoreInRepo bool
 	AttachMedia bool
-	Dir         string
-	Branch      string
+
+	// GitLabAttachMedia resolves the same attach_media setting, defaulting off
+	// for GitLab so uploading real-data screenshots requires explicit opt-in.
+	GitLabAttachMedia bool
+
+	Dir    string
+	Branch string
 	// CommitMessage is the configured subject template; empty keeps the
 	// built-in subject (see RenderCommitMessage).
 	CommitMessage string
@@ -1328,6 +1414,9 @@ type Evidence struct {
 	LocalRoot string
 	Retention time.Duration
 	MaxRuns   int
+	// LinkBaseURL is the normalized test.evidence.link_base_url (trimmed, no
+	// trailing slash). Empty keeps evidence files cited as local paths.
+	LinkBaseURL string
 }
 
 // EvalRaw is the YAML representation of local evaluation-corpus settings.
@@ -1888,9 +1977,20 @@ intent:
 # directory timer: retention ages run directories out (default 14 days) and
 # max_runs caps how many survive regardless of age (default 200). Set retention
 # to "unlimited", or either to 0, to disable that bound. local_root moves the
-# directory to another disk and must be an absolute path. These three are
-# global-only - a repository's .no-mistakes.yaml cannot change where this
-# machine writes evidence or how long it keeps it.
+# directory to another disk and must be an absolute path. evidence_dir is the
+# other way to move it: a ~/path is expanded, and a missing or unwritable
+# directory falls back to <NM_HOME>/evidence with a warning. A run keeps the
+# directory it started with. These settings are global-only - a repository's
+# .no-mistakes.yaml cannot change where this machine writes evidence or how
+# long it keeps it.
+# link_base_url is for an operator who serves that evidence parent over HTTP
+# themselves (a synced folder behind a web server, say). See Evidence links
+# in docs/src/content/docs/reference/global-config.md for the linked surfaces
+# and precedence. On GitLab, with uploads off, the Evidence section lists
+# the run's images as links without uploading them. Unset
+# leaves PR bodies unchanged. Global-only like local_root; a repository value
+# is ignored. Hosting and access control of the served copy are yours.
+# evidence_dir: ~/Dropbox/no-mistakes-evidence
 # commit_message templates the evidence-branch commit subject with
 # {{.Branch}} and {{.RunID}}; it follows commit.fix_message's template rules.
 # test:
@@ -1903,6 +2003,7 @@ intent:
 #     local_root: /var/lib/no-mistakes/evidence
 #     retention: 720h
 #     max_runs: 50
+#     link_base_url: https://evidence.example.com/no-mistakes
 
 # Local review evaluation corpus, used by "no-mistakes eval" to compare
 # agent candidates, pinned to an explicit model and reasoning effort, against
@@ -2781,6 +2882,15 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if !repoOnly.AutoFix.Gates.IsZero() {
 		return nil, fmt.Errorf("auto_fix.gates is repository-only; configure it on the trusted default branch")
 	}
+	if strings.TrimSpace(raw.CI.Instructions) != "" {
+		return nil, fmt.Errorf("ci.instructions is repository-only; configure it on the trusted default branch")
+	}
+	if raw.Test.InstructionsFile != "" {
+		return nil, fmt.Errorf("test.instructions_file is repository-only; configure it on the trusted default branch")
+	}
+	if len(raw.Test.PathInstructions) > 0 {
+		return nil, fmt.Errorf("test.path_instructions is repository-only; configure it on the trusted default branch")
+	}
 	if err := validatePRAppendix(raw.PR.Appendix); err != nil {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
@@ -2974,6 +3084,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if raw.LogLevel != "" {
 		cfg.LogLevel = raw.LogLevel
 	}
+	cfg.EvidenceDir = strings.TrimSpace(raw.EvidenceDir)
 	if raw.SessionReuse != nil {
 		cfg.SessionReuse = *raw.SessionReuse
 	}
@@ -3187,6 +3298,7 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	// LoadGlobalFromBytes uses to refuse the repository-only auto_fix.gates.
 	var globalOnly struct {
 		QuotaRouting yaml.Node `yaml:"quota_routing"`
+		EvidenceDir  yaml.Node `yaml:"evidence_dir"`
 	}
 	if err := yaml.Unmarshal(data, &globalOnly); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
@@ -3194,10 +3306,18 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	if !globalOnly.QuotaRouting.IsZero() {
 		return nil, fmt.Errorf("quota_routing is global-only; configure it in ~/.no-mistakes/config.yaml on this machine")
 	}
+	if !globalOnly.EvidenceDir.IsZero() {
+		return nil, fmt.Errorf("evidence_dir is global-only; configure it in ~/.no-mistakes/config.yaml on this machine")
+	}
 	cfg := &RepoConfig{}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
+	unknownTest, err := unknownTestKeys(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse repo config: %w", err)
+	}
+	cfg.UnknownTestKeys = unknownTest
 	if err := validateCommitRaw(cfg.Commit); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
@@ -3215,6 +3335,9 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 		cfg.ProtectedPaths[i] = pattern
 	}
 	if err := validateTestRaw(cfg.Test); err != nil {
+		return nil, fmt.Errorf("parse repo config: %w", err)
+	}
+	if err := validateTestGuidance(cfg.Test); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
 	if err := validateIntentCheck(&cfg.Intent.Check); err != nil {
@@ -3315,6 +3438,9 @@ func validatePRIntent(intent PRIntentRaw) error {
 // invalid block has to fail here, before it merges, rather than brick the
 // repository's pipeline afterwards. Do not scope this to the trusted copy.
 func validateReviewRaw(review ReviewRaw) error {
+	if review.MaxFixRounds < 0 {
+		return fmt.Errorf("review.max_fix_rounds must be non-negative (0 means unlimited)")
+	}
 	if review.AgentTimeout != "" {
 		if _, err := parsePositiveDuration("review.agent_timeout", review.AgentTimeout); err != nil {
 			return err
@@ -3455,15 +3581,17 @@ func validatePathInstructionGlob(pattern string) error {
 // The exceptions inside test are prepare, which eagerly runs setup before an
 // agent-only Test, base_attribution, which re-runs a failing commands.test on
 // the base commit, evidence.branch, which names a git ref the daemon pushes
-// to, instructions, which steers the gate that validates the pushed branch,
-// and allow_approve_over_failure, which waives the required check for an
-// approved-over-failure commands.test. All five are trusted-only.
+// to, instructions, instructions_file, and path_instructions, which steer the
+// gate that validates the pushed branch, and allow_approve_over_failure, which
+// waives the required check for an approved-over-failure commands.test. All
+// of them are trusted-only.
 func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *RepoConfig {
 	if pushed == nil {
 		pushed = &RepoConfig{}
 	}
 	effective := *pushed
 	effective.TrustedIgnorePatterns = nil
+	effective.UnknownTestKeys = labeledUnknownTestKeys(pushed, trusted)
 	if trusted != nil {
 		effective.TrustedIgnorePatterns = append([]string(nil), trusted.IgnorePatterns...)
 		effective.Document = trusted.Document
@@ -3520,6 +3648,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// in either direction, so it is trusted-only regardless of
 		// allow_repo_commands.
 		effective.Rebase = trusted.Rebase
+		effective.Push = copyPush(trusted.Push)
 		// test.evidence.branch names the git ref evidence commits are pushed
 		// to with the maintainer's credentials. It is trusted-only so a pushed
 		// branch cannot aim them at another branch of the repository; the rest
@@ -3535,6 +3664,11 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// must not be able to rewrite or weaken the guidance that steers the
 		// gate validating their own branch.
 		effective.Test.Instructions = trusted.Test.Instructions
+		// test.instructions_file and test.path_instructions are more of the
+		// same runbook, so they are trusted-only for the same reason. The
+		// files they name are read from the pinned trusted commit too.
+		effective.Test.InstructionsFile = trusted.Test.InstructionsFile
+		effective.Test.PathInstructions = copyTestPathInstructions(trusted.Test.PathInstructions)
 		// The eager setup trigger is trusted-only even when executable command
 		// values may come from the pushed branch.
 		effective.Test.Prepare = trusted.Test.Prepare
@@ -3571,8 +3705,11 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		effective.NoCI = false
 		effective.CI = CIRaw{}
 		effective.Rebase = RebaseRaw{}
+		effective.Push = Push{}
 		effective.Test.Evidence.Branch = nil
 		effective.Test.Instructions = ""
+		effective.Test.InstructionsFile = ""
+		effective.Test.PathInstructions = nil
 		effective.Test.Prepare = false
 		effective.Test.BaseAttribution = false
 		effective.Test.AllowApproveOverFailure = ""
@@ -3686,6 +3823,7 @@ func applyTestOverrides(dst *Test, src *TestRaw) {
 	}
 	if src.Evidence.AttachMedia != nil {
 		dst.Evidence.AttachMedia = *src.Evidence.AttachMedia
+		dst.Evidence.GitLabAttachMedia = *src.Evidence.AttachMedia
 	}
 	if src.Evidence.Dir != nil && strings.TrimSpace(*src.Evidence.Dir) != "" {
 		dst.Evidence.Dir = strings.TrimSpace(*src.Evidence.Dir)
@@ -3716,6 +3854,11 @@ func applyEvidenceStorageOverrides(dst *Evidence, src *EvidenceRaw) {
 	}
 	if src.MaxRuns != nil && *src.MaxRuns >= 0 {
 		dst.MaxRuns = *src.MaxRuns
+	}
+	if src.LinkBaseURL != nil {
+		if base, err := normalizeEvidenceLinkBaseURL(*src.LinkBaseURL); err == nil {
+			dst.LinkBaseURL = base
+		}
 	}
 }
 
@@ -3905,7 +4048,40 @@ func validateTestRaw(test TestRaw) error {
 	if test.Evidence.MaxRuns != nil && *test.Evidence.MaxRuns < 0 {
 		return fmt.Errorf("test.evidence.max_runs must be 0 (keep every run) or greater, got %d", *test.Evidence.MaxRuns)
 	}
+	if test.Evidence.LinkBaseURL != nil {
+		if _, err := normalizeEvidenceLinkBaseURL(*test.Evidence.LinkBaseURL); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// normalizeEvidenceLinkBaseURL validates test.evidence.link_base_url and
+// returns it trimmed with no trailing slash, so <base>/<run-id>/<file> joins
+// cleanly. Only an absolute http(s) URL with a host is accepted: the value is
+// published verbatim in every PR body, so a scheme a browser will not follow,
+// embedded credentials, or a query or fragment the run path would land after
+// are refused when the config loads instead of surfacing as dead links. Empty
+// is the off state.
+func normalizeEvidenceLinkBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if strings.ContainsAny(raw, " \t\r\n") {
+		return "", fmt.Errorf("test.evidence.link_base_url must not contain whitespace, got %q", raw)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("test.evidence.link_base_url must be an absolute http or https URL, got %q", raw)
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("test.evidence.link_base_url must not carry credentials, got %q", raw)
+	}
+	if strings.ContainsAny(raw, "?#") {
+		return "", fmt.Errorf("test.evidence.link_base_url must not carry a query or fragment, got %q", raw)
+	}
+	return strings.TrimRight(raw, "/"), nil
 }
 
 // applyProvidersOverrides applies non-nil raw values onto resolved defaults.
@@ -4122,6 +4298,9 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 	// word on how many workflow runs their project is billed for.
 	applyCIOverrides(&ci, &global.CI)
 	applyCIOverrides(&ci, &repo.CI)
+	// Like test.instructions, the guidance describes one repository, so it is
+	// never taken from global config; repo is already trusted-only here.
+	ci.Instructions = strings.TrimSpace(repo.CI.Instructions)
 
 	// The repo value is trusted-only (EffectiveRepoConfig sourced it from the
 	// default branch), so a maintainer's chosen integration shape survives a
@@ -4150,6 +4329,9 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 	test.Prepare = repo.Test.Prepare
 	test.BaseAttribution = repo.Test.BaseAttribution
 	test.Instructions = strings.TrimSpace(repo.Test.Instructions)
+	test.InstructionsFile = strings.TrimSpace(repo.Test.InstructionsFile)
+	test.PathInstructions = resolveTestPathInstructions(repo.Test.PathInstructions)
+	test.UnknownKeys = append([]string(nil), repo.UnknownTestKeys...)
 	test.AllowApproveOverFailure = strings.TrimSpace(repo.Test.AllowApproveOverFailure)
 
 	commit := Commit{FixMessage: DefaultFixMessageTemplate}
@@ -4261,6 +4443,7 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		AutoFix:        af,
 		CI:             ci,
 		Rebase:         rebase,
+		Push:           copyPush(repo.Push),
 		Commit:         commit,
 		Intent:         intent,
 		Test:           test,
@@ -4270,6 +4453,7 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		// separate sources rather than overlaid: they can only add rules, never
 		// replace or remove the repository's.
 		Review: Review{
+			MaxFixRounds:           int(repo.Review.MaxFixRounds),
 			Conversation:           repo.Review.Conversation,
 			PathInstructions:       resolvePathInstructions(repo.Review.PathInstructions),
 			GlobalPathInstructions: resolvePathInstructions(global.Review.PathInstructions),
@@ -4299,6 +4483,13 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		cfg.Review.RepositoryPathInstructions = resolvePathInstructions(override.Review.PathInstructions)
 		cfg.Document.RepositoryInstructions = strings.TrimSpace(override.Document.Instructions)
 		cfg.Test.RepositoryInstructions = strings.TrimSpace(override.Test.Instructions)
+		if len(override.ReviewAgents) > 0 {
+			// Per role: a named role replaces the global entry, the rest keep it.
+			roles := make(map[string]ReviewAgent, len(global.ReviewAgents)+len(override.ReviewAgents))
+			maps.Copy(roles, global.ReviewAgents)
+			maps.Copy(roles, override.ReviewAgents)
+			cfg.ReviewAgents = roles
+		}
 	}
 
 	if repo.Agent != "" {
